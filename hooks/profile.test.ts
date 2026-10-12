@@ -23,6 +23,7 @@ function stage(on: any, answers: string[] = []) {
   on('session.id', () => ({ value: 'sess-1' }))
   on('session.start', (_$: any, e: any) => ({ cwd: e.cwd }))
   on('command.register', () => ({ value: { name: 'profile' } }))
+  on('session.measure', (_$: any, e: any) => ({ changed: e.changed }))
   const clock = mock.clock(on)
   on('fs.read', (_$: any, e: any) => (e.path in files ? { value: files[e.path] } : { error: 'ENOENT' }))
   on('fs.write', (_$: any, e: any) => ((files[e.path] = e.text), { value: undefined }))
@@ -103,6 +104,19 @@ test('switching back to the login the session started on drops the token', async
   expect(env.ANTHROPIC_AUTH_TOKEN).toBe('t-work')
   await run($, 'main')
   expect(env.ANTHROPIC_AUTH_TOKEN).toBeUndefined()
+})
+
+test('plan usage from each response is kept per account', async ($, on) => {
+  const { signIn, clock } = stage(on)
+  const measure = (five: number, seven: number) =>
+    $.session.measure({ context: {} as any, rateLimits: [{ kind: 'five_hour', percentUsed: five }, { kind: 'seven_day', percentUsed: seven }], changed: ['rateLimits'] })
+  await measure(23.4, 40)
+  await run($, 'add work')
+  signIn('t-work', 'w@x')
+  await clock.advance(3000)
+  await run($, 'work')
+  await measure(5, 12)
+  expect(await run($, 'list')).toContain('○ main  me@x · 5h 23% 7d 40%\n● work  w@x · 5h 5% 7d 12% · active')
 })
 
 test('bare /profile picks from a dialog, falls back to the list', async ($, on) => {

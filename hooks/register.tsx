@@ -15,7 +15,17 @@ const ADD = 'Add account…'
 const FOOTER = '/profile <name> switch · /profile add <name> · /profile remove <name>'
 
 type Login = { creds: string; oauthAccount?: { emailAddress?: string } }
-type Row = { name: string; email?: string; isActive: boolean; isPending: boolean }
+type Row = { name: string; email?: string; usage?: string; isActive: boolean; isPending: boolean }
+
+// Plan usage from the rate-limit headers of each response: whichever account the
+// session's requests go to reports its own, even on a switched token.
+const WINDOWS: Record<string, string> = { five_hour: '5h', seven_day: '7d' }
+const usageText = (limits: { kind: string; percentUsed: number }[]) =>
+  limits.map(l => `${WINDOWS[l.kind] ?? l.kind} ${Math.round(l.percentUsed)}%`).join(' ')
+
+async function usage($: EngineInterface, name: string): Promise<string | undefined> {
+  return (await $.store.get(`usage:${name}`)) as string | undefined
+}
 
 async function names($: EngineInterface): Promise<string[]> {
   return ((await $.store.get('logins')) as string[] | undefined) ?? ['main']
@@ -85,7 +95,7 @@ async function rows($: EngineInterface): Promise<Row[]> {
   const cur = await current($)
   return Promise.all((await names($)).map(async name => {
     const login = name === cur ? await liveLogin($) : await slot($, name)
-    return { name, email: login?.oauthAccount?.emailAddress, isActive: name === cur, isPending: !login }
+    return { name, email: login?.oauthAccount?.emailAddress, usage: await usage($, name), isActive: name === cur, isPending: !login }
   }))
 }
 
@@ -93,14 +103,16 @@ async function rows($: EngineInterface): Promise<Row[]> {
 function listText(list: Row[]): string {
   const w = Math.max(...list.map(r => r.name.length))
   const line = (r: Row) => {
-    const detail = [r.email, r.isPending && 'sign-in pending', r.isActive && 'active'].filter(Boolean).join(' · ')
+    const detail = [r.email, r.usage, r.isPending && 'sign-in pending', r.isActive && 'active'].filter(Boolean).join(' · ')
     return `${r.isActive ? '●' : '○'} ${r.name.padEnd(w)}  ${detail}`.trimEnd()
   }
   return ['Accounts', ...list.map(line), '', FOOTER].join('\n')
 }
 
 async function show($: EngineInterface) {
-  $.ui.status(`account: ${await current($)}`)
+  const cur = await current($)
+  const u = await usage($, cur)
+  $.ui.status(`account: ${cur}${u ? ` · ${u}` : ''}`)
 }
 
 /**
@@ -155,7 +167,7 @@ async function use($: EngineInterface, name: string): Promise<string> {
   const email = login.oauthAccount?.emailAddress
   return [
     `✓ Switched to ${name}${email ? ` (${email})` : ''}`,
-    `This session uses it from your next message; reopen Claude Code for its usage, email and connectors.`,
+    `This session uses it from your next message, and its plan usage shows here after that; reopen Claude Code for /usage, email and connectors.`,
   ].join('\n')
 }
 
@@ -201,6 +213,14 @@ export const register: Register = on => {
     const key = `startedOn:${await $.session.id()}`
     if (!(await $.env.get('ANTHROPIC_AUTH_TOKEN')) && !(await $.store.get(key))) await $.store.set(key, await current($))
     await show($)
+    return next(e)
+  })
+
+  on('session.measure', async ($, e, next) => {
+    if (e.changed.includes('rateLimits') && e.rateLimits.length) {
+      await $.store.set(`usage:${await current($)}`, usageText(e.rateLimits))
+      await show($)
+    }
     return next(e)
   })
 
