@@ -1,0 +1,18 @@
+{
+  "$schema": "https://anthropic.com/claude-code/marketplace.schema.json",
+  "name": "claude-code-profile-switcher",
+  "description": "Switch Claude Code between accounts with /profile.",
+  "owner": {
+    "name": "ultramenid",
+    "url": "https://github.com/ultramenid"
+  },
+  "plugins": [
+    {
+      "name": "profile",
+      "description": "Switch Claude Code's login between accounts: /profile add <name> saves a full login, /profile <name> makes it the live one.",
+      "version": "0.1.1",
+      "source": "./",
+      "category": "productivity"
+    }
+  ]
+}
