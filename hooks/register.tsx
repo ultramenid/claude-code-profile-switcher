@@ -119,6 +119,18 @@ async function save($: EngineInterface, name: string) {
   if (live) await setKey($, SLOT, name, JSON.stringify(live))
 }
 
+/**
+ * Claude Code drops Remote Control when the signed-in account changes; reconnect it
+ * under the new one when it was in use (on at startup, or a remote client attached).
+ */
+async function reconnectRemote($: EngineInterface) {
+  const settings = JSON.parse(await $.fs.read(`${await $.env.get('HOME')}/.claude/settings.json`).catch(() => '{}'))
+  const attached = (await $.session.surfaces().catch(() => [])).some(s => s !== 'terminal')
+  // From a timer, outside the /profile run: a command can't start inside the one running.
+  if (settings.remoteControlAtStartup || attached)
+    $.clock.after(500, () => void $.command.run({ command: 'remote-control', args: '' }).catch(() => undefined))
+}
+
 /** Makes `name`'s slot the live login. */
 async function load($: EngineInterface, name: string, login: Login) {
   await setKey($, LIVE, await liveAccount($), login.creds)
@@ -168,6 +180,7 @@ function watchSignIn($: EngineInterface, name: string, prev: string, prevToken: 
     pending.delete(name)
     const back = await slot($, prev)
     if (back) await load($, prev, back)
+    await reconnectRemote($)
     $.ui.toast(`✓ ${name} signed in as ${live.oauthAccount.emailAddress} · /profile ${name} to switch`, { timeoutMs: 8000 })
   })())
 }
@@ -197,6 +210,7 @@ async function use($: EngineInterface, name: string): Promise<string> {
   if (!login) return `! ${name} isn't signed in · /profile add ${name}`
   await save($, cur)
   await load($, name, login)
+  await reconnectRemote($)
   // Back on the login this session started with: drop the token so usage and email return.
   const startedOn = (await $.store.get(`startedOn:${await $.session.id()}`)) as string | undefined
   await $.env.set('ANTHROPIC_AUTH_TOKEN', name === startedOn ? undefined : accessToken(login.creds))

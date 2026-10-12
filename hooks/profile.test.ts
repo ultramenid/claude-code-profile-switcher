@@ -17,6 +17,9 @@ function stage(on: any, answers: string[] = []) {
   const files: Record<string, string> = { '/home/u/.claude.json': JSON.stringify({ theme: 'dark', oauthAccount: { emailAddress: 'me@x' } }) }
   const env: Record<string, string | undefined> = { HOME: '/home/u', USER: 'me' }
   const argvs: string[] = []
+  const remote: string[] = []
+  on('command.run', { command: 'remote-control' }, () => (remote.push('run'), { text: '' }))
+  on('session.surfaces', () => ({ value: ['terminal'] }))
   on('env.get', (_$: any, e: any) => ({ value: env[e.name] }))
   on('env.set', (_$: any, e: any) => ((env[e.name] = e.value), { value: undefined }))
   mock.store(on)
@@ -25,7 +28,7 @@ function stage(on: any, answers: string[] = []) {
   on('command.register', () => ({ value: { name: 'profile' } }))
   on('session.measure', (_$: any, e: any) => ({ changed: e.changed }))
   const clock = mock.clock(on)
-  on('fs.read', (_$: any, e: any) => (e.path in files ? { value: files[e.path] } : { error: 'ENOENT' }))
+  on('fs.read', (_$: any, e: any) => (e.path in files ? { value: files[e.path] } : { deny: 'ENOENT' }))
   on('fs.write', (_$: any, e: any) => ((files[e.path] = e.text), { value: undefined }))
   on('process.run', (_$: any, e: any) => {
     const a: string[] = e.argv
@@ -57,7 +60,7 @@ function stage(on: any, answers: string[] = []) {
     files['/home/u/.claude.json'] = JSON.stringify({ ...JSON.parse(files['/home/u/.claude.json']!), oauthAccount: { emailAddress: email } })
   }
   const liveEmail = () => JSON.parse(files['/home/u/.claude.json']!).oauthAccount.emailAddress
-  return { keychain, env, argvs, signIn, liveEmail, clock }
+  return { keychain, env, argvs, signIn, liveEmail, clock, files, remote }
 }
 
 test('add captures a full login and puts the current one back; switching swaps the live login', async ($, on) => {
@@ -122,6 +125,18 @@ test('plan usage from each response is kept per account', async ($, on) => {
   const usage = await $.command.run({ command: 'usage', args: '', origin: { kind: 'plugin', name: 'profile' }, presentation: { isFullscreen: false, columns: 80 } } as any)
   expect(usage.text).toContain('Plan usage · work (w@x)')
   expect(usage.text).toContain('5h  █░░░░░░░░░░░░░░░░░░░ 5%')
+})
+
+test('reconnects Remote Control after a switch when it is on at startup', async ($, on) => {
+  const { files, remote, signIn, clock } = stage(on)
+  files['/home/u/.claude/settings.json'] = '{"remoteControlAtStartup":true}'
+  await run($, 'add work')
+  signIn('t-work', 'w@x')
+  await clock.advance(3500)
+  expect(remote.length).toBe(1) // after add put main back
+  await run($, 'work')
+  await clock.advance(500)
+  expect(remote.length).toBe(2) // after add put main back, and after the switch
 })
 
 test('bare /profile picks from a dialog, falls back to the list', async ($, on) => {
