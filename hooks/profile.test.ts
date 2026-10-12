@@ -117,6 +117,9 @@ test('plan usage from each response is kept per account', async ($, on) => {
   await run($, 'work')
   await measure(5, 12)
   expect(await run($, 'list')).toContain('○ main  me@x · 5h 23% 7d 40%\n● work  w@x · 5h 5% 7d 12% · active')
+  const usage = await $.command.run({ command: 'usage', args: '', origin: { kind: 'plugin', name: 'profile' }, presentation: { isFullscreen: false, columns: 80 } } as any)
+  expect(usage.text).toContain('Plan usage · work (w@x)')
+  expect(usage.text).toContain('5h  █░░░░░░░░░░░░░░░░░░░ 5%')
 })
 
 test('bare /profile picks from a dialog, falls back to the list', async ($, on) => {

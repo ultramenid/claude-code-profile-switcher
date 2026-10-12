@@ -20,11 +20,31 @@ type Row = { name: string; email?: string; usage?: string; isActive: boolean; is
 // Plan usage from the rate-limit headers of each response: whichever account the
 // session's requests go to reports its own, even on a switched token.
 const WINDOWS: Record<string, string> = { five_hour: '5h', seven_day: '7d' }
-const usageText = (limits: { kind: string; percentUsed: number }[]) =>
-  limits.map(l => `${WINDOWS[l.kind] ?? l.kind} ${Math.round(l.percentUsed)}%`).join(' ')
+type Limit = { kind: string; percentUsed: number; resetsAt?: string }
+
+async function limits($: EngineInterface, name: string): Promise<Limit[] | undefined> {
+  const l = await $.store.get(`limits:${name}`)
+  return Array.isArray(l) ? (l as Limit[]) : undefined
+}
 
 async function usage($: EngineInterface, name: string): Promise<string | undefined> {
-  return (await $.store.get(`usage:${name}`)) as string | undefined
+  return (await limits($, name))?.map(l => `${WINDOWS[l.kind] ?? l.kind} ${Math.round(l.percentUsed)}%`).join(' ')
+}
+
+/** `/usage` for a session on a switched token, whose own /usage reads the login it started with. */
+async function usagePanel($: EngineInterface, name: string): Promise<string> {
+  const email = (await liveLogin($))?.oauthAccount?.emailAddress
+  const list = await limits($, name)
+  const when = (iso?: string) => (iso ? ` · resets ${new Date(iso).toLocaleString([], { weekday: 'short', hour: '2-digit', minute: '2-digit' })}` : '')
+  const bar = (p: number) => '█'.repeat(Math.round(Math.min(p, 100) / 5)).padEnd(20, '░')
+  return [
+    `Plan usage · ${name}${email ? ` (${email})` : ''}`,
+    ...(list?.length
+      ? list.map(l => `${(WINDOWS[l.kind] ?? l.kind).padEnd(3)} ${bar(l.percentUsed)} ${Math.round(l.percentUsed)}%${when(l.resetsAt)}`)
+      : ['No reading yet: send a message first.']),
+    '',
+    'From response headers (this session switched with /profile). Reopen Claude Code for the full /usage.',
+  ].join('\n')
 }
 
 async function names($: EngineInterface): Promise<string[]> {
@@ -218,10 +238,17 @@ export const register: Register = on => {
 
   on('session.measure', async ($, e, next) => {
     if (e.changed.includes('rateLimits') && e.rateLimits.length) {
-      await $.store.set(`usage:${await current($)}`, usageText(e.rateLimits))
+      await $.store.set(`limits:${await current($)}`, e.rateLimits)
       await show($)
     }
     return next(e)
+  })
+
+  on('command.run', { command: 'usage' }, async ($, e, next) => {
+    const cur = await current($)
+    const startedOn = await $.store.get(`startedOn:${await $.session.id()}`)
+    if (!(await $.env.get('ANTHROPIC_AUTH_TOKEN')) || cur === startedOn) return next(e)
+    return { text: await usagePanel($, cur) }
   })
 
   on('command.run', { command: 'profile' }, async ($, e) => {

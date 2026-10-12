@@ -26,7 +26,7 @@ Claude Code keeps its login in the macOS Keychain entry `Claude Code-credentials
 
 ## Limitations
 
-- **This session after a switch:** it loaded its login at start, so until you reopen, requests use the new account's access token, while `/usage`, the email and connectors still show the account the session started on. Plan usage still works here: each response reports its account's 5-hour and 7-day usage, which `/profile list` and the status line show from your first message on the new account. The token expires after a few hours; reopen before then. Switching back to the account the session started on clears the token, so its usage and email show again without a reopen.
+- **This session after a switch:** it loaded its login at start, so until you reopen, requests use the new account's access token, while the email and connectors still show the account the session started on. Plan usage still works: each response reports its account's 5-hour and 7-day usage, and from your first message on the new account `/usage`, `/profile list` and the status line show it. The token expires after a few hours; reopen before then. Switching back to the account the session started on clears the token, so its usage and email show again without a reopen.
 - **One login for all sessions:** every Claude Code window on this Mac shares the live login. A switch moves new windows too, and an open window still on the old account may write its refreshed token back over the switch: reopen open windows after switching.
 - **Refreshed tokens:** an account's saved copy is updated only when you switch away from it. If a copy stops working, `/profile remove <name>` and `/profile add <name>` again.
 - **macOS only:** the logins live in the macOS Keychain.
