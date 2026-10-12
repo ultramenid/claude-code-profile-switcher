@@ -8,6 +8,11 @@ Switch Claude Code's login between accounts with `/profile`. Each account is a f
 /plugin install profile --marketplace ultramenid/claude-code-profile-switcher
 ```
 
+> [!WARNING]
+> **Switch only with `/profile`.** Claude Code refreshes the live login every few hours, and the old refresh key stops working. The plugin saves the latest version when you switch away with `/profile`. If the login changes another way (you run `/login`, or another open Claude Code window writes its old login back), that account's saved copy may stop working, and switching to it leaves you logged out.
+>
+> Fix: `/profile remove <name>`, then `/profile add <name>`, or `/login` while on it. Reopen other Claude Code windows after switching.
+
 ## Commands
 
 | Command | Effect |
@@ -31,7 +36,6 @@ Claude Code keeps its login in the macOS Keychain entry `Claude Code-credentials
 
 - **This session after a switch:** it loaded its login at start, so until you reopen, requests use the new account's access token, while Claude Code's own `/status` and claude.ai connectors still use the account the session started on. Plan usage still works: each response reports its account's 5-hour and 7-day usage, and from your first message on the new account `/usage`, `/profile list` and the status line show it. The token expires after a few hours; reopen before then. Switching back to the account the session started on clears the token, so its usage and email show again without a reopen.
 - **One login for all sessions:** every Claude Code window on this Mac shares the live login. A switch moves new windows too, and an open window still on the old account may write its refreshed token back over the switch: reopen open windows after switching.
-- **Saved logins can go stale:** Claude Code refreshes the live login every few hours, and the old refresh key stops working. The plugin saves the latest version when you switch away with `/profile`, so normal use is fine. But if the login changes another way (you run `/login`, or another open window writes its old login back), that account's saved copy may stop working, and switching to it leaves you logged out. Fix: `/profile remove <name>`, then `/profile add <name>`, or `/login` while on it.
 - **Remote Control:** Claude Code disconnects it whenever the signed-in account changes and shows a notice. If Remote Control is on at startup or a remote client is attached, the plugin runs `/remote-control` after each switch to reconnect it under the new account.
 - **macOS only:** the logins live in the macOS Keychain.
 - If something goes wrong, `/login` always gets you a working login again.
