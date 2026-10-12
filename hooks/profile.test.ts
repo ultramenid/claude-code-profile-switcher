@@ -140,6 +140,19 @@ test('reconnects Remote Control after a switch when it is on at startup', async 
   expect(remote.length).toBe(2) // after add put main back, and after the switch
 })
 
+test('reconnects Remote Control when another window switches the login', async ($, on) => {
+  const { files, remote, signIn, clock } = stage(on)
+  files['/home/u/.claude/settings.json'] = '{"remoteControlAtStartup":true}'
+  await $.session.start({ source: 'startup', cwd: '/p' } as any)
+  await clock.advance(5000)
+  expect(remote.length).toBe(0) // nothing changed
+  signIn('t-work', 'w@x') // e.g. /profile work in another window
+  await clock.advance(5500)
+  expect(remote.length).toBe(1)
+  await clock.advance(5000)
+  expect(remote.length).toBe(1) // once per change
+})
+
 test('bare /profile picks from a dialog, falls back to the list', async ($, on) => {
   const { signIn, clock } = stage(on, ['work (w@x)'])
   expect(await run($, '')).toContain('● main  me@x · active')

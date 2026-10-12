@@ -196,11 +196,28 @@ async function save($: EngineInterface, name: string) {
  * under the new one when it was in use (on at startup, or a remote client attached).
  */
 async function reconnectRemote($: EngineInterface) {
+  seen = await signedIn($)
   const settings = JSON.parse(await $.fs.read(`${await home($)}/.claude/settings.json`).catch(() => '{}'))
   const attached = (await $.session.surfaces().catch(() => [])).some(s => s !== 'terminal')
   // From a timer, outside the /profile run: a command can't start inside the one running.
   if (settings.remoteControlAtStartup || attached)
     $.clock.after(500, () => void $.command.run({ command: 'remote-control', args: '' }).catch(() => undefined))
+}
+
+/** The live account's id, from ~/.claude.json (cheap enough to poll). */
+async function signedIn($: EngineInterface) {
+  const config = await $.fs.read(await configPath($)).then(JSON.parse).catch(() => ({}))
+  return config.oauthAccount?.accountUuid ?? config.oauthAccount?.emailAddress
+}
+
+let seen: string | undefined
+/** Another window can switch the login too; follow it so this window's Remote Control reconnects. */
+async function watchLogin($: EngineInterface) {
+  seen = await signedIn($)
+  $.clock.every(5000, () => void (async () => {
+    if (pending.size) return // an add briefly swaps the login and puts it back
+    if ((await signedIn($)) !== seen) await reconnectRemote($)
+  })())
 }
 
 /** Makes `name`'s slot the live login. */
@@ -333,6 +350,7 @@ export const register: Register = on => {
     const key = `startedOn:${await $.session.id()}`
     if (!(await $.env.get('ANTHROPIC_AUTH_TOKEN')) && !(await $.store.get(key))) await $.store.set(key, await current($))
     await show($)
+    await watchLogin($)
     return next(e)
   })
 
