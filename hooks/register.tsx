@@ -14,7 +14,7 @@ const NAME = /^[\w.-]+$/
 const ADD = 'Add account…'
 const FOOTER = '/profile <name> switch · /profile add <name> · /profile remove <name>'
 
-type Login = { creds: string; oauthAccount?: { emailAddress?: string } }
+type Login = { creds: string; oauthAccount?: { accountUuid?: string; emailAddress?: string } }
 type Row = { name: string; email?: string; usage?: string; isActive: boolean; isPending: boolean }
 
 // Plan usage from the rate-limit headers of each response: whichever account the
@@ -47,12 +47,29 @@ async function usagePanel($: EngineInterface, name: string): Promise<string> {
   ].join('\n')
 }
 
+// Accounts are the Keychain slots themselves, and the live one is whichever slot
+// holds the live login's account: nothing to lose when the plugin's store resets.
+const pending = new Set<string>() // added, browser sign-in not finished yet
+
 async function names($: EngineInterface): Promise<string[]> {
-  return ((await $.store.get('logins')) as string[] | undefined) ?? ['main']
+  const r = await $.process.run(['sh', '-c', `security dump-keychain | awk '/^keychain:/{a=""} /"acct"<blob>=/{a=$0} /"svce"<blob>="${SLOT}"/{print a}'`]).catch(() => undefined)
+  const saved = [...(r?.stdout ?? '').matchAll(/"acct"<blob>="([^"]*)"/g)].map(m => m[1]!)
+  return [...new Set([...saved, ...pending])].sort((a, b) => (a === 'main' ? -1 : b === 'main' ? 1 : a.localeCompare(b)))
 }
 
+const sameAccount = (a?: Login['oauthAccount'], b?: Login['oauthAccount']) =>
+  !!a && !!b && (a.accountUuid && b.accountUuid ? a.accountUuid === b.accountUuid : a.emailAddress === b.emailAddress)
+
+/** The slot holding the live login's account; a login not saved yet gets a name of its own. */
 async function current($: EngineInterface): Promise<string> {
-  return ((await $.store.get('current')) as string | undefined) ?? 'main'
+  const live = (await liveLogin($))?.oauthAccount
+  const all = await names($)
+  for (const name of all) if (sameAccount(live, (await slot($, name))?.oauthAccount)) return name
+  if (!all.includes('main')) return 'main'
+  const base = live?.emailAddress?.split('@')[0]?.replace(/[^\w.-]/g, '') || 'account'
+  let name = base
+  for (let i = 2; all.includes(name); i++) name = `${base}${i}`
+  return name
 }
 
 async function getKey($: EngineInterface, service: string, account?: string): Promise<string | undefined> {
@@ -108,12 +125,12 @@ async function load($: EngineInterface, name: string, login: Login) {
   const path = await configPath($)
   const config = JSON.parse(await $.fs.read(path).catch(() => '{}'))
   await $.fs.write(path, `${JSON.stringify({ ...config, oauthAccount: login.oauthAccount }, null, 2)}\n`)
-  await $.store.set('current', name)
 }
 
 async function rows($: EngineInterface): Promise<Row[]> {
   const cur = await current($)
-  return Promise.all((await names($)).map(async name => {
+  const all = await names($)
+  return Promise.all((all.includes(cur) ? all : [cur, ...all]).map(async name => {
     const login = name === cur ? await liveLogin($) : await slot($, name)
     return { name, email: login?.oauthAccount?.emailAddress, usage: await usage($, name), isActive: name === cur, isPending: !login }
   }))
@@ -142,12 +159,13 @@ async function show($: EngineInterface) {
 function watchSignIn($: EngineInterface, name: string, prev: string, prevToken: string | undefined) {
   let ticks = 0
   const timer = $.clock.every(3000, () => void (async () => {
-    if (++ticks > 200) return timer.cancel()
+    if (++ticks > 200) return (pending.delete(name), timer.cancel())
     const live = await liveLogin($)
     const tok = accessToken(live?.creds)
     if (!live || !tok || tok === prevToken || !live.oauthAccount?.emailAddress) return
     timer.cancel()
     await setKey($, SLOT, name, JSON.stringify(live))
+    pending.delete(name)
     const back = await slot($, prev)
     if (back) await load($, prev, back)
     $.ui.toast(`✓ ${name} signed in as ${live.oauthAccount.emailAddress} · /profile ${name} to switch`, { timeoutMs: 8000 })
@@ -163,8 +181,7 @@ async function add($: EngineInterface, name: string): Promise<string> {
   const log = `${await $.env.get('HOME')}/.claude/cc-swap-login.log`
   // Detached: login waits on the browser callback, far past a hook's 10s budget.
   await $.process.run(['sh', '-c', 'nohup env -u CLAUDE_CONFIG_DIR -u ANTHROPIC_AUTH_TOKEN claude auth login >"$1" 2>&1 &', 'sh', log])
-  const all = await names($)
-  if (!all.includes(name)) await $.store.set('logins', [...all, name])
+  pending.add(name)
   watchSignIn($, name, cur, prevToken)
   return [
     `✓ Sign-in for ${name} opened in your browser`,
@@ -195,7 +212,7 @@ async function remove($: EngineInterface, name: string): Promise<string> {
   if (!(await names($)).includes(name)) return '! Usage: /profile remove <name>'
   if ((await current($)) === name) return `! ${name} is the active login · switch away first`
   await $.process.run(['security', 'delete-generic-password', '-s', SLOT, '-a', name]).catch(() => undefined)
-  await $.store.set('logins', (await names($)).filter(n => n !== name))
+  pending.delete(name)
   return `✓ Removed ${name}`
 }
 
@@ -227,8 +244,6 @@ export const register: Register = on => {
       description: 'Switch your Claude login between accounts',
       argumentHint: '[name | add <name> | remove <name> | list]',
     })
-    // Before 0.10 `current` named an env-token account, not the live login.
-    if (!(await $.store.get('logins'))) await $.store.delete('current')
     // The login this process loaded; a reload mid-switch (token set) keeps the first answer.
     const key = `startedOn:${await $.session.id()}`
     if (!(await $.env.get('ANTHROPIC_AUTH_TOKEN')) && !(await $.store.get(key))) await $.store.set(key, await current($))

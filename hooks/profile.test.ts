@@ -31,6 +31,8 @@ function stage(on: any, answers: string[] = []) {
     const a: string[] = e.argv
     argvs.push(a.join(' '))
     const out = (stdout: string, exitCode = 0) => ({ value: { exitCode, stdout, stderr: '', isStdoutTruncated: false, isStderrTruncated: false } })
+    if (a[0] === 'sh' && a[2]!.includes('dump-keychain'))
+      return out(Object.keys(keychain).filter(k => k.startsWith('cc-swap-login|')).map(k => `    "acct"<blob>="${k.split('|')[1]}"`).join('\n'))
     if (a[0] !== 'security') return out('')
     if (a[1] === '-i') {
       const [, s, acct, hex] = /-s "([^"]+)" -a "([^"]+)" -X (\w+)/.exec(e.init.stdin)!
