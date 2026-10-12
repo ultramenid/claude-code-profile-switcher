@@ -34,6 +34,7 @@ function stage(on: any, answers: string[] = []) {
     const a: string[] = e.argv
     argvs.push(a.join(' '))
     const out = (stdout: string, exitCode = 0) => ({ value: { exitCode, stdout, stderr: '', isStdoutTruncated: false, isStderrTruncated: false } })
+    if (a[0] === 'uname') return out('Darwin\n')
     if (a[0] === 'sh' && a[2]!.includes('dump-keychain'))
       return out(Object.keys(keychain).filter(k => k.startsWith('cc-swap-login|')).map(k => `    "acct"<blob>="${k.split('|')[1]}"`).join('\n'))
     if (a[0] !== 'security') return out('')
@@ -157,4 +158,45 @@ test('autocompletes accounts and verbs', async ($, on) => {
     $.prompt.autocomplete({ text, cursor: text.length, token, start: text.length - token.length }).then(r => r.suggestions.map(s => s.text))
   expect(await ac('/profile w', 'w')).toEqual(['work'])
   expect(await ac('/profile r', 'r')).toEqual(['remove'])
+})
+
+test('on Linux the logins are files: ~/.claude/.credentials.json and ~/.claude/profile-logins', async ($, on) => {
+  const files: Record<string, string> = {
+    '/home/u/.claude.json': JSON.stringify({ oauthAccount: { emailAddress: 'me@x' } }),
+    '/home/u/.claude/.credentials.json': creds('t-main'),
+  }
+  const argvs: string[] = []
+  const env: Record<string, string | undefined> = { HOME: '/home/u' }
+  on('env.get', (_$: any, e: any) => ({ value: env[e.name] }))
+  on('env.set', (_$: any, e: any) => ((env[e.name] = e.value), { value: undefined }))
+  mock.store(on)
+  const clock = mock.clock(on)
+  on('session.id', () => ({ value: 'sess-1' }))
+  on('session.surfaces', () => ({ value: ['terminal'] }))
+  on('fs.read', (_$: any, e: any) => (e.path in files ? { value: files[e.path] } : { deny: 'ENOENT' }))
+  on('fs.write', (_$: any, e: any) => ((files[e.path] = e.text), { value: undefined }))
+  on('fs.list', (_$: any, e: any) => ({
+    value: Object.keys(files).filter(f => f.startsWith(`${e.path}/`)).map(f => ({ name: f.slice(e.path.length + 1), kind: 'file', size: 1, mtimeMs: 0, isLink: false })),
+  }))
+  on('process.run', (_$: any, e: any) => {
+    argvs.push(e.argv.join(' '))
+    if (e.argv[0] === 'rm') delete files[e.argv[2]]
+    return { value: { exitCode: 0, stdout: e.argv[0] === 'uname' ? 'Linux\n' : '', stderr: '', isStdoutTruncated: false, isStderrTruncated: false } }
+  })
+
+  await run($, 'add work')
+  expect(argvs.some(a => a.includes('security'))).toBe(false)
+  files['/home/u/.claude/.credentials.json'] = creds('t-work') // what `claude auth login` writes
+  files['/home/u/.claude.json'] = JSON.stringify({ oauthAccount: { emailAddress: 'w@x' } })
+  await clock.advance(3000)
+  expect(files['/home/u/.claude/profile-logins/work.json']).toContain('t-work')
+  expect(files['/home/u/.claude/.credentials.json']).toBe(creds('t-main')) // main put back
+  expect(argvs.some(a => a.includes('chmod 600'))).toBe(true)
+
+  expect(await run($, 'work')).toContain('✓ Switched to work (w@x)')
+  expect(files['/home/u/.claude/.credentials.json']).toBe(creds('t-work'))
+  expect(await run($, 'list')).toContain('● work  w@x · active')
+  await run($, 'main')
+  expect(await run($, 'remove work')).toBe('✓ Removed work')
+  expect(files['/home/u/.claude/profile-logins/work.json']).toBeUndefined()
 })

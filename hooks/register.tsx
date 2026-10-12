@@ -1,13 +1,14 @@
 import type { EngineInterface, Register } from 'claude-code'
 
-// Swaps Claude Code's own /login. The live login is the Keychain entry
-// "Claude Code-credentials" plus `oauthAccount` in ~/.claude.json; every account
-// keeps a copy of both in the Keychain (service cc-swap-login). Switching saves
+// Swaps Claude Code's own /login. The live login is the credential Claude Code
+// stores (macOS: Keychain entry "Claude Code-credentials"; Linux and Windows:
+// ~/.claude/.credentials.json) plus `oauthAccount` in ~/.claude.json. Every account
+// keeps a copy of both (macOS: Keychain service cc-swap-login; elsewhere
+// ~/.claude/profile-logins/<name>.json, owner-only). Switching saves
 // the live login into the current account's copy and loads the target's, so the
 // next `claude` starts fully on it: plan usage, email, connectors.
 // This session loaded its login at start, so it also gets the target's access
 // token as ANTHROPIC_AUTH_TOKEN until it ends.
-// ponytail: macOS Keychain only; a .credentials.json branch when another OS needs it.
 const LIVE = 'Claude Code-credentials'
 const SLOT = 'cc-swap-login'
 const NAME = /^[\w.-]+$/
@@ -47,13 +48,19 @@ async function usagePanel($: EngineInterface, name: string): Promise<string> {
   ].join('\n')
 }
 
-// Accounts are the Keychain slots themselves, and the live one is whichever slot
+// Accounts are the saved slots themselves, and the live one is whichever slot
 // holds the live login's account: nothing to lose when the plugin's store resets.
 const pending = new Set<string>() // added, browser sign-in not finished yet
 
 async function names($: EngineInterface): Promise<string[]> {
-  const r = await $.process.run(['sh', '-c', `security dump-keychain | awk '/^keychain:/{a=""} /"acct"<blob>=/{a=$0} /"svce"<blob>="${SLOT}"/{print a}'`]).catch(() => undefined)
-  const saved = [...(r?.stdout ?? '').matchAll(/"acct"<blob>="([^"]*)"/g)].map(m => m[1]!)
+  let saved: string[]
+  if ((await platform($)) === 'mac') {
+    const r = await $.process.run(['sh', '-c', `security dump-keychain | awk '/^keychain:/{a=""} /"acct"<blob>=/{a=$0} /"svce"<blob>="${SLOT}"/{print a}'`]).catch(() => undefined)
+    saved = [...(r?.stdout ?? '').matchAll(/"acct"<blob>="([^"]*)"/g)].map(m => m[1]!)
+  } else {
+    const entries = await $.fs.list(await slotDir($)).catch(() => [])
+    saved = entries.filter(f => f.kind === 'file' && f.name.endsWith('.json')).map(f => f.name.slice(0, -5))
+  }
   return [...new Set([...saved, ...pending])].sort((a, b) => (a === 'main' ? -1 : b === 'main' ? 1 : a.localeCompare(b)))
 }
 
@@ -70,6 +77,71 @@ async function current($: EngineInterface): Promise<string> {
   let name = base
   for (let i = 2; all.includes(name); i++) name = `${base}${i}`
   return name
+}
+
+// Where Claude Code keeps its login differs by OS; everything else is shared.
+let os: 'mac' | 'linux' | 'win' | undefined
+
+async function platform($: EngineInterface): Promise<'mac' | 'linux' | 'win'> {
+  if (os) return os
+  if ((await $.env.get('OS')) === 'Windows_NT') return (os = 'win')
+  const r = await $.process.run(['uname']).catch(() => undefined)
+  return (os = r?.stdout.trim() === 'Darwin' ? 'mac' : 'linux')
+}
+
+async function home($: EngineInterface): Promise<string> {
+  return ((await $.env.get('HOME')) ?? (await $.env.get('USERPROFILE')) ?? '').replace(/\\/g, '/')
+}
+
+const credsFile = async ($: EngineInterface) => `${await home($)}/.claude/.credentials.json`
+const slotDir = async ($: EngineInterface) => `${await home($)}/.claude/profile-logins`
+
+/** Writes a secret file readable by its owner only (Windows: the profile folder is already). */
+async function writeSecret($: EngineInterface, path: string, text: string) {
+  const plat = await platform($)
+  if (plat === 'linux') await $.process.run(['sh', '-c', 'mkdir -p "$(dirname "$1")" && umask 077 && : >"$1" && chmod 600 "$1"', 'sh', path])
+  if (plat === 'win') await $.process.run(['cmd', '/c', 'mkdir', path.slice(0, path.lastIndexOf('/')).replace(/\//g, '\\')]).catch(() => undefined)
+  await $.fs.write(path, text)
+}
+
+async function readLive($: EngineInterface): Promise<string | undefined> {
+  if ((await platform($)) === 'mac') return getKey($, LIVE)
+  return (await $.fs.read(await credsFile($)).catch(() => '')).trim() || undefined
+}
+
+async function writeLive($: EngineInterface, creds: string) {
+  if ((await platform($)) === 'mac') return setKey($, LIVE, await liveAccount($), creds)
+  await writeSecret($, await credsFile($), creds)
+}
+
+async function readSlot($: EngineInterface, name: string): Promise<string | undefined> {
+  if ((await platform($)) === 'mac') return getKey($, SLOT, name)
+  return (await $.fs.read(`${await slotDir($)}/${name}.json`).catch(() => '')).trim() || undefined
+}
+
+async function writeSlot($: EngineInterface, name: string, value: string) {
+  if ((await platform($)) === 'mac') return setKey($, SLOT, name, value)
+  await writeSecret($, `${await slotDir($)}/${name}.json`, value)
+}
+
+async function deleteSlot($: EngineInterface, name: string) {
+  const plat = await platform($)
+  const file = `${await slotDir($)}/${name}.json`
+  const argv = plat === 'mac' ? ['security', 'delete-generic-password', '-s', SLOT, '-a', name]
+    : plat === 'win' ? ['cmd', '/c', 'del', '/q', file.replace(/\//g, '\\')]
+    : ['rm', '-f', file]
+  await $.process.run(argv).catch(() => undefined)
+}
+
+/** `claude auth login`, detached: it waits on the browser callback, far past a hook's 10s budget. */
+async function startLogin($: EngineInterface, log: string) {
+  if ((await platform($)) === 'win') {
+    const cmd = `/c set "ANTHROPIC_AUTH_TOKEN=" & set "CLAUDE_CONFIG_DIR=" & claude auth login`
+    await $.process.run(['powershell', '-NoProfile', '-Command',
+      `Start-Process -WindowStyle Hidden -FilePath cmd.exe -ArgumentList '${cmd}' -RedirectStandardOutput '${log.replace(/'/g, "''")}'`])
+    return
+  }
+  await $.process.run(['sh', '-c', 'nohup env -u CLAUDE_CONFIG_DIR -u ANTHROPIC_AUTH_TOKEN claude auth login >"$1" 2>&1 &', 'sh', log])
 }
 
 async function getKey($: EngineInterface, service: string, account?: string): Promise<string | undefined> {
@@ -98,25 +170,25 @@ const accessToken = (creds: string | undefined): string | undefined => {
 }
 
 async function configPath($: EngineInterface) {
-  return `${await $.env.get('HOME')}/.claude.json`
+  return `${await home($)}/.claude.json`
 }
 
 async function liveLogin($: EngineInterface): Promise<Login | undefined> {
-  const creds = await getKey($, LIVE)
+  const creds = await readLive($)
   if (!creds) return undefined
   const config = JSON.parse(await $.fs.read(await configPath($)).catch(() => '{}'))
   return { creds, oauthAccount: config.oauthAccount }
 }
 
 async function slot($: EngineInterface, name: string): Promise<Login | undefined> {
-  const raw = await getKey($, SLOT, name)
+  const raw = await readSlot($, name)
   return raw ? JSON.parse(raw) : undefined
 }
 
 /** Copies the live login into `name`'s slot (the token may have refreshed since it was loaded). */
 async function save($: EngineInterface, name: string) {
   const live = await liveLogin($)
-  if (live) await setKey($, SLOT, name, JSON.stringify(live))
+  if (live) await writeSlot($, name, JSON.stringify(live))
 }
 
 /**
@@ -124,7 +196,7 @@ async function save($: EngineInterface, name: string) {
  * under the new one when it was in use (on at startup, or a remote client attached).
  */
 async function reconnectRemote($: EngineInterface) {
-  const settings = JSON.parse(await $.fs.read(`${await $.env.get('HOME')}/.claude/settings.json`).catch(() => '{}'))
+  const settings = JSON.parse(await $.fs.read(`${await home($)}/.claude/settings.json`).catch(() => '{}'))
   const attached = (await $.session.surfaces().catch(() => [])).some(s => s !== 'terminal')
   // From a timer, outside the /profile run: a command can't start inside the one running.
   if (settings.remoteControlAtStartup || attached)
@@ -133,7 +205,7 @@ async function reconnectRemote($: EngineInterface) {
 
 /** Makes `name`'s slot the live login. */
 async function load($: EngineInterface, name: string, login: Login) {
-  await setKey($, LIVE, await liveAccount($), login.creds)
+  await writeLive($, login.creds)
   const path = await configPath($)
   const config = JSON.parse(await $.fs.read(path).catch(() => '{}'))
   await $.fs.write(path, `${JSON.stringify({ ...config, oauthAccount: login.oauthAccount }, null, 2)}\n`)
@@ -176,7 +248,7 @@ function watchSignIn($: EngineInterface, name: string, prev: string, prevToken: 
     const tok = accessToken(live?.creds)
     if (!live || !tok || tok === prevToken || !live.oauthAccount?.emailAddress) return
     timer.cancel()
-    await setKey($, SLOT, name, JSON.stringify(live))
+    await writeSlot($, name, JSON.stringify(live))
     pending.delete(name)
     const back = await slot($, prev)
     if (back) await load($, prev, back)
@@ -191,9 +263,8 @@ async function add($: EngineInterface, name: string): Promise<string> {
   const cur = await current($)
   await save($, cur) // the login is about to replace it
   const prevToken = accessToken((await liveLogin($))?.creds)
-  const log = `${await $.env.get('HOME')}/.claude/cc-swap-login.log`
-  // Detached: login waits on the browser callback, far past a hook's 10s budget.
-  await $.process.run(['sh', '-c', 'nohup env -u CLAUDE_CONFIG_DIR -u ANTHROPIC_AUTH_TOKEN claude auth login >"$1" 2>&1 &', 'sh', log])
+  const log = `${await home($)}/.claude/cc-swap-login.log`
+  await startLogin($, log)
   pending.add(name)
   watchSignIn($, name, cur, prevToken)
   return [
@@ -225,7 +296,7 @@ async function use($: EngineInterface, name: string): Promise<string> {
 async function remove($: EngineInterface, name: string): Promise<string> {
   if (!(await names($)).includes(name)) return '! Usage: /profile remove <name>'
   if ((await current($)) === name) return `! ${name} is the active login · switch away first`
-  await $.process.run(['security', 'delete-generic-password', '-s', SLOT, '-a', name]).catch(() => undefined)
+  await deleteSlot($, name)
   pending.delete(name)
   return `✓ Removed ${name}`
 }

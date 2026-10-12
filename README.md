@@ -30,12 +30,20 @@ The status line shows `account: <name> · 5h 23% 7d 40%`. Your login when you fi
 
 `/profile add` runs `claude auth login`, which briefly makes the new account the live login; once it finishes, the plugin saves that login and puts your previous one back.
 
-Claude Code keeps its login in the macOS Keychain entry `Claude Code-credentials`, and the account details in `oauthAccount` in `~/.claude.json`. The plugin keeps a copy of both for each account in the Keychain (service `cc-swap-login`). A switch saves the live login into the current account's copy (keeping any token refresh), then writes the target's copy into Claude Code's entry and `~/.claude.json`. Secrets go to `security` on stdin, never on the command line. The account list and which one is live are read from those Keychain entries, so reinstalling the plugin loses nothing.
+Claude Code keeps its login, and the account details in `oauthAccount` in `~/.claude.json`, in a place that depends on the OS. The plugin keeps a copy of both for each account next to it:
+
+| OS | Claude Code's login | The plugin's saved accounts |
+|---|---|---|
+| macOS | Keychain entry `Claude Code-credentials` | Keychain, service `cc-swap-login` |
+| Linux | `~/.claude/.credentials.json` | `~/.claude/profile-logins/<name>.json` (mode 600) |
+| Windows | `%USERPROFILE%\.claude\.credentials.json` | `%USERPROFILE%\.claude\profile-logins\<name>.json` |
+ A switch saves the live login into the current account's copy (keeping any token refresh), then writes the target's copy into Claude Code's entry and `~/.claude.json`. On macOS, secrets go to `security` on stdin, never on the command line. The account list and which one is live are read from those saved copies, so reinstalling the plugin loses nothing.
 
 ## Limitations
 
 - **This session after a switch:** it loaded its login at start, so until you reopen, requests use the new account's access token, while Claude Code's own `/status` and claude.ai connectors still use the account the session started on. Plan usage still works: each response reports its account's 5-hour and 7-day usage, and from your first message on the new account `/usage`, `/profile list` and the status line show it. The token expires after a few hours; reopen before then. Switching back to the account the session started on clears the token, so its usage and email show again without a reopen.
-- **One login for all sessions:** every Claude Code window on this Mac shares the live login. A switch moves new windows too, and an open window still on the old account may write its refreshed token back over the switch: reopen open windows after switching.
+- **One login for all sessions:** every Claude Code window on this computer shares the live login. A switch moves new windows too, and an open window still on the old account may write its refreshed token back over the switch: reopen open windows after switching.
 - **Remote Control:** Claude Code disconnects it whenever the signed-in account changes and shows a notice. If Remote Control is on at startup or a remote client is attached, the plugin runs `/remote-control` after each switch to reconnect it under the new account.
-- **macOS only:** the logins live in the macOS Keychain.
+- **Windows is untested:** macOS is tested in daily use and Linux by the test suite; Windows follows the same file layout as Linux but hasn't been run yet. Reports welcome.
+- `CLAUDE_CONFIG_DIR` isn't supported: the plugin swaps the default login only.
 - If something goes wrong, `/login` always gets you a working login again.
