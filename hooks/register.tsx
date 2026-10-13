@@ -15,10 +15,13 @@ const LIVE = 'Claude Code-credentials'
 const SLOT = 'cc-swap-login'
 const NAME = /^[\w.-]+$/
 const API = 'api'
+const VERBS = ['add', 'remove', 'list', 'status'] // /profile <verb> can never reach an account named so
 const ADD = 'Add account…'
+const ADD_SUB = 'Subscription account (Pro, Max, Team)'
+const ADD_API = 'API credit (Console key)'
 const FOOTER = '/profile <name> switch · /profile add <name> · /profile remove <name>'
 
-type Login = { creds: string; oauthAccount?: { accountUuid?: string; emailAddress?: string } }
+type Login = { creds: string; oauthAccount?: { accountUuid?: string; organizationUuid?: string; emailAddress?: string } }
 type Row = { name: string; email?: string; usage?: string; isActive: boolean; isPending: boolean }
 
 // Plan usage from the rate-limit headers of each response: whichever account the
@@ -28,32 +31,45 @@ type Limit = { kind: string; percentUsed: number; resetsAt?: string }
 
 async function limits($: EngineInterface, name: string): Promise<Limit[] | undefined> {
   const l = await $.store.get(`limits:${name}`)
-  return Array.isArray(l) ? (l as Limit[]) : undefined
+  if (!Array.isArray(l)) return undefined
+  const now = await $.clock.now()
+  // A window past its reset has started over, though no response has said so yet.
+  return (l as Limit[]).map(w => (w.resetsAt && Date.parse(w.resetsAt) <= now ? { kind: w.kind, percentUsed: 0 } : w))
 }
 
 // A switched session's own reading can still be the login it started with, so there
 // its account's windows come from the plan's usage endpoint (what /usage reads), asked
 // with the credential the session sends.
 const USAGE_URL = 'https://api.anthropic.com/api/oauth/usage'
-let usageNext = 0 // the endpoint takes a few reads a minute: once a minute, five after a 429
+let usageNext = 0 // the endpoint takes a few reads a minute: once a minute
+let usageBackoff = 0 // and none for five minutes after a 429, forced or not
 
 /** The live credential's windows from the usage endpoint, kept as its account's reading; undefined off a subscription or on failure. */
 async function planUsage($: EngineInterface, force = false): Promise<Limit[] | undefined> {
   const now = await $.clock.now()
-  if (!force && now < usageNext) return undefined
+  if (now < usageBackoff || (!force && now < usageNext)) return undefined
   const auth = await $.session.authorize().catch(() => null)
   if (auth?.kind !== 'bearer') return undefined
-  usageNext = now + 60_000
+  usageNext = Math.max(usageNext, now + 60_000)
   try {
-    const res = await $.http.fetch(USAGE_URL, { auth: auth.handle, headers: { 'anthropic-beta': 'oauth-2025-04-20' } })
-    if (res.status === 429) usageNext = now + 300_000
+    const name = await active($) // whose credential `auth` is: a switch while the read is in flight doesn't relabel it
+    // Raced with a timer: a stalled endpoint would hold up the switch queue behind it.
+    const res = await Promise.race([
+      $.http.fetch(USAGE_URL, { auth: auth.handle, headers: { 'anthropic-beta': 'oauth-2025-04-20' } }).catch(() => undefined),
+      $.clock.sleep(10_000).then(() => undefined),
+    ])
+    if (!res) return undefined
+    if (res.status === 429) usageBackoff = now + 300_000
     if (!res.ok) return undefined
     const body = JSON.parse(res.text)
     const list: Limit[] = Object.keys(WINDOWS).flatMap(kind => {
       const w = body?.[kind]
       return typeof w?.utilization === 'number' ? [{ kind, percentUsed: Math.round(w.utilization * 10) / 10, ...(w.resets_at ? { resetsAt: w.resets_at } : {}) }] : []
     })
-    if (list.length) await $.store.set(`limits:${await current($)}`, list)
+    if (list.length) await $.store.set(`limits:${name}`, list)
+    // Extra usage keeps an account going past its windows, till its monthly limit (null: none).
+    const x = body?.extra_usage
+    await $.store.set(`extra:${name}`, x?.is_enabled === true && (x.monthly_limit == null || !(x.used_credits >= x.monthly_limit)))
     return list
   } catch {
     return undefined
@@ -66,7 +82,7 @@ async function usage($: EngineInterface, name: string): Promise<string | undefin
 
 /** `/usage` for a session on a switched token, whose own /usage reads the login it started with. */
 async function usagePanel($: EngineInterface, name: string): Promise<string> {
-  const email = (await liveLogin($))?.oauthAccount?.emailAddress
+  const email = (await loginOf($, name))?.oauthAccount?.emailAddress
   const list = await limits($, name)
   const when = (iso?: string) => (iso ? ` · resets ${new Date(iso).toLocaleString([], { weekday: 'short', hour: '2-digit', minute: '2-digit' })}` : '')
   const bar = (p: number) => '▰'.repeat(Math.round(Math.min(p, 100) / 5)).padEnd(20, '▱')
@@ -87,8 +103,10 @@ const pending = new Set<string>() // added, browser sign-in not finished yet
 async function names($: EngineInterface): Promise<string[]> {
   let saved: string[]
   if ((await platform($)) === 'mac') {
-    const r = await $.process.run(['sh', '-c', `security dump-keychain | awk '/^keychain:/{a=""} /"acct"<blob>=/{a=$0} /"svce"<blob>="${SLOT}"/{print a}'`]).catch(() => undefined)
-    saved = [...(r?.stdout ?? '').matchAll(/"acct"<blob>="([^"]*)"/g)].map(m => m[1]!)
+    // A failed read is an error, never "no accounts": a startup reading none would pin the wrong login.
+    const r = await $.process.run(['sh', '-c', `out=$(security dump-keychain) || exit 1; printf '%s\\n' "$out" | awk '/^keychain:/{a=""} /"acct"<blob>=/{a=$0} /"svce"<blob>="${SLOT}"/{print a}'`])
+    if (r.exitCode !== 0) throw new Error(`Couldn't list the saved accounts in the Keychain (exit ${r.exitCode})`)
+    saved = [...r.stdout.matchAll(/"acct"<blob>="([^"]*)"/g)].map(m => m[1]!)
   } else {
     const entries = await $.fs.list(await slotDir($)).catch(() => [])
     saved = entries.filter(f => f.kind === 'file' && f.name.endsWith('.json')).map(f => f.name.slice(0, -5))
@@ -98,7 +116,9 @@ async function names($: EngineInterface): Promise<string[]> {
 }
 
 const sameAccount = (a?: Login['oauthAccount'], b?: Login['oauthAccount']) =>
-  !!a && !!b && (a.accountUuid && b.accountUuid ? a.accountUuid === b.accountUuid : a.emailAddress === b.emailAddress)
+  !!a && !!b && (a.accountUuid && b.accountUuid
+    ? a.accountUuid === b.accountUuid && (!a.organizationUuid || !b.organizationUuid || a.organizationUuid === b.organizationUuid)
+    : a.emailAddress === b.emailAddress)
 
 /** The slot holding the live login's account; a login not saved yet gets a name of its own. */
 async function current($: EngineInterface): Promise<string> {
@@ -106,7 +126,8 @@ async function current($: EngineInterface): Promise<string> {
   const all = await names($)
   for (const name of all) if (sameAccount(live, (await slot($, name))?.oauthAccount)) return name
   if (!all.includes('main')) return 'main'
-  const base = live?.emailAddress?.split('@')[0]?.replace(/[^\w.-]/g, '') || 'account'
+  const email = live?.emailAddress?.split('@')[0]?.replace(/[^\w.-]/g, '') || 'account'
+  const base = [API, ...VERBS].includes(email) ? `${email}-login` : email
   let name = base
   for (let i = 2; all.includes(name); i++) name = `${base}${i}`
   return name
@@ -118,8 +139,8 @@ let os: 'mac' | 'linux' | 'win' | undefined
 async function platform($: EngineInterface): Promise<'mac' | 'linux' | 'win'> {
   if (os) return os
   if ((await $.env.get('OS')) === 'Windows_NT') return (os = 'win')
-  const r = await $.process.run(['uname']).catch(() => undefined)
-  return (os = r?.stdout.trim() === 'Darwin' ? 'mac' : 'linux')
+  const r = await $.process.run(['uname']) // a failure refuses (and asks again next time), never guesses Linux on a Mac
+  return (os = r.stdout.trim() === 'Darwin' ? 'mac' : 'linux')
 }
 
 async function home($: EngineInterface): Promise<string> {
@@ -131,10 +152,13 @@ const slotDir = async ($: EngineInterface) => `${await home($)}/.claude/profile-
 
 /** Writes a secret file readable by its owner only (Windows: the profile folder is already). */
 async function writeSecret($: EngineInterface, path: string, text: string) {
-  const plat = await platform($)
-  if (plat === 'linux') await $.process.run(['sh', '-c', 'mkdir -p "$(dirname "$1")" && umask 077 && : >"$1" && chmod 600 "$1"', 'sh', path])
-  if (plat === 'win') await $.process.run(['cmd', '/c', 'mkdir', path.slice(0, path.lastIndexOf('/')).replace(/\//g, '\\')]).catch(() => undefined)
-  await $.fs.write(path, text)
+  if ((await platform($)) === 'win') {
+    await $.process.run(['cmd', '/c', 'mkdir', path.slice(0, path.lastIndexOf('/')).replace(/\//g, '\\')]).catch(() => undefined)
+    return $.fs.write(path, text)
+  }
+  // Owner-only from the first byte, and whole or not at all: a file moved into place, the secret on stdin.
+  const r = await $.process.run(['sh', '-c', 'mkdir -p "$(dirname "$1")" && umask 077 && cat >"$1.$$" && mv -f "$1.$$" "$1"', 'sh', path], { stdin: text })
+  if (r.exitCode !== 0) throw new Error(`Writing ${path} failed (exit ${r.exitCode}): nothing changed`)
 }
 
 async function readLive($: EngineInterface): Promise<string | undefined> {
@@ -157,35 +181,58 @@ async function writeSlot($: EngineInterface, name: string, value: string) {
   await writeSecret($, `${await slotDir($)}/${name}.json`, value)
 }
 
-async function deleteSlot($: EngineInterface, name: string) {
+/** Whether the slot is gone (or never was). */
+async function deleteSlot($: EngineInterface, name: string): Promise<boolean> {
   const plat = await platform($)
   const file = `${await slotDir($)}/${name}.json`
   const argv = plat === 'mac' ? ['security', 'delete-generic-password', '-s', SLOT, '-a', name]
     : plat === 'win' ? ['cmd', '/c', 'del', '/q', file.replace(/\//g, '\\')]
     : ['rm', '-f', file]
-  await $.process.run(argv).catch(() => undefined)
+  const r = await $.process.run(argv).catch(() => undefined)
+  return !!r && (r.exitCode === 0 || (plat === 'mac' && r.exitCode === 44)) // 44: no such item
 }
 
-/** `claude auth login`, detached: it waits on the browser callback, far past a hook's 10s budget. */
-async function startLogin($: EngineInterface, log: string) {
+/**
+ * `claude auth login`, detached: it waits on the browser callback, far past a hook's 10s budget.
+ * It stops when the add gives up (10 minutes), so a browser tab finished later can't replace the
+ * live login; its pid, to stop it sooner.
+ */
+async function startLogin($: EngineInterface, log: string): Promise<string | undefined> {
   if ((await platform($)) === 'win') {
     const cmd = `/c set "ANTHROPIC_AUTH_TOKEN=" & set "CLAUDE_CONFIG_DIR=" & claude auth login`
     await $.process.run(['powershell', '-NoProfile', '-Command',
       `Start-Process -WindowStyle Hidden -FilePath cmd.exe -ArgumentList '${cmd}' -RedirectStandardOutput '${log.replace(/'/g, "''")}'`])
     return
   }
-  await $.process.run(['sh', '-c', 'nohup env -u CLAUDE_CONFIG_DIR -u ANTHROPIC_AUTH_TOKEN claude auth login >"$1" 2>&1 &', 'sh', log])
+  const r = await $.process.run(['sh', '-c', 'command -v claude >/dev/null || exit 127; nohup env -u CLAUDE_CONFIG_DIR -u ANTHROPIC_AUTH_TOKEN -u ANTHROPIC_API_KEY claude auth login >"$1" 2>&1 & p=$!; (sleep 600; ps -p $p -o command= | grep -q "auth login" && kill $p) >/dev/null 2>&1 & echo $p', 'sh', log])
+  if (r.exitCode === 127) throw new Error("`claude` isn't on the PATH plugins run with here, so the sign-in can't open · run /profile add from Claude Code in a terminal")
+  return /^\d+$/.exec(r.stdout.trim())?.[0]
+}
+
+/** Whether `claude auth login` still runs as `pid` (a pid that exited may be another process's by now); unknown reads as running. */
+async function loginRunning($: EngineInterface, pid: string | undefined): Promise<boolean> {
+  if (!pid) return true
+  const r = await $.process.run(['ps', '-p', pid, '-o', 'command=']).catch(() => undefined)
+  return !r || r.stdout.includes('auth login')
 }
 
 async function getKey($: EngineInterface, service: string, account?: string): Promise<string | undefined> {
-  const r = await $.process.run(['security', 'find-generic-password', '-s', service, ...(account ? ['-a', account] : []), '-w']).catch(() => undefined)
-  return r?.exitCode === 0 ? r.stdout.trim() || undefined : undefined
+  const r = await $.process.run(['security', 'find-generic-password', '-s', service, ...(account ? ['-a', account] : []), '-w'])
+  // Locked, or no prompt allowed: an error, never "not signed in", which a startup would pin as the wrong login.
+  if (r.exitCode !== 0 && r.exitCode !== 44) throw new Error(`Couldn't read the Keychain (security exit ${r.exitCode})`)
+  const out = r.exitCode === 0 ? r.stdout.trim() : ''
+  // security -w prints a password with any non-ASCII byte (a name like Zoë) as hex; JSON never reads as hex
+  return (/^(?:[0-9a-f]{2})+$/i.test(out) ? new TextDecoder().decode(Uint8Array.from(out.match(/../g)!, h => parseInt(h, 16))) : out) || undefined
 }
 
 /** Writes through `security -i` on stdin, hex-encoded, so the secret never shows in argv. */
 async function setKey($: EngineInterface, service: string, account: string, value: string) {
   const hex = Array.from(new TextEncoder().encode(value), b => b.toString(16).padStart(2, '0')).join('')
-  await $.process.run(['security', '-i'], { stdin: `add-generic-password -U -s "${service}" -a "${account}" -X ${hex}\n` })
+  const line = `add-generic-password -U -s "${service}" -a "${account}" -X ${hex}\n`
+  // security -i reads lines of up to 4095 bytes and runs what fits: a longer one would store a cut-off login.
+  if (line.length > 4000) throw new Error(`A ${value.length}-byte login is too large for a Keychain write on stdin (MCP servers' sign-ins share Claude Code's entry): nothing changed`)
+  const r = await $.process.run(['security', '-i'], { stdin: line })
+  if (r.exitCode !== 0) throw new Error(`The Keychain write failed (security exit ${r.exitCode}): nothing changed`)
 }
 
 /** The account attribute Claude Code filed its entry under, so the swap overwrites that entry. */
@@ -224,13 +271,37 @@ async function liveLogin($: EngineInterface): Promise<Login | undefined> {
 
 async function slot($: EngineInterface, name: string): Promise<Login | undefined> {
   const raw = await readSlot($, name)
-  return raw ? JSON.parse(raw) : undefined
+  try {
+    return raw ? JSON.parse(raw) : undefined
+  } catch {
+    return undefined // cut off: not signed in, and /profile remove takes it out
+  }
 }
 
-/** Copies the live login into `name`'s slot (the token may have refreshed since it was loaded). */
+/** `name`'s login: the live one when it's the live account, else its slot. */
+async function loginOf($: EngineInterface, name: string): Promise<Login | undefined> {
+  return name === (await current($)) ? liveLogin($) : slot($, name)
+}
+
+/**
+ * A login's own part of Claude Code's credential, as a slot keeps it: the rest (MCP
+ * servers' sign-ins) stays with whichever login is live, so a switch never rolls it back.
+ */
+const own = (login: Login): Login => ({ ...login, creds: JSON.stringify({ claudeAiOauth: JSON.parse(login.creds).claudeAiOauth }) })
+
+/**
+ * Copies the live login into `name`'s slot (the token may have refreshed since it was
+ * loaded), never over another account's: another window may have switched meanwhile.
+ */
 async function save($: EngineInterface, name: string) {
   const live = await liveLogin($)
-  if (live) await writeSlot($, name, JSON.stringify(live))
+  const saved = await slot($, name)
+  // No account on it (~/.claude.json unreadable): nothing to tell it by later, so nothing to save.
+  if (!live?.oauthAccount || (saved && !sameAccount(live.oauthAccount, saved.oauthAccount))) return
+  // Another account's own token under this account's name: a switch caught between its two writes.
+  const tok = accessToken(live.creds)
+  for (const other of await names($)) if (tok && other !== name && other !== API && accessToken((await slot($, other))?.creds) === tok) return
+  await writeSlot($, name, JSON.stringify(own(live)))
 }
 
 /**
@@ -243,7 +314,7 @@ async function reconnectRemote($: EngineInterface) {
   seen = await signedIn($)
   const settings = JSON.parse(await $.fs.read(`${await home($)}/.claude/settings.json`).catch(() => '{}'))
   const surfaces = await $.session.surfaces().catch((): string[] => [])
-  const isOn = surfaces.includes('mobile') || (await $.store.get(`remote:${await $.session.id()}`)) === true
+  const isOn = surfaces.includes('mobile') || (await $.env.get('CLAUDE_PROFILE_REMOTE')) === '1'
     || (settings.remoteControlAtStartup && surfaces.includes('terminal'))
   // From a timer, outside the /profile run: a command can't start inside the one running.
   if (isOn) $.clock.after(500, () => void $.command.run({ command: 'remote-control', args: '' }).catch(() => undefined))
@@ -261,11 +332,16 @@ async function watchLogin($: EngineInterface) {
   seen = await signedIn($)
   $.clock.every(5000, () => void (async () => {
     if (pending.size) return // an add briefly swaps the login and puts it back
-    if ((await signedIn($)) !== seen) await reconnectRemote($)
+    const id = await signedIn($)
+    if (id === undefined) return // unreadable for a moment (mid-write), or signed out: nothing to reconnect
+    if (await adding($)) { // another window's: reconnect once it's over, if the login moved meanwhile
+      if (id !== seen) seen = undefined
+      return
+    }
+    if (id !== seen) await reconnectRemote($)
   })())
   $.clock.every(60_000, () => {
-    $.ui.invalidate('ui.render') // the reset countdowns
-    void writeStatus($).catch(() => undefined)
+    void show($).catch(() => undefined) // what other windows stored meanwhile, and the reset countdowns
     void syncToken($).catch(() => undefined)
     void backFromApi($).catch(() => undefined)
   })
@@ -277,19 +353,27 @@ async function watchLogin($: EngineInterface) {
  */
 async function syncToken($: EngineInterface) {
   const held = await $.env.get('ANTHROPIC_AUTH_TOKEN')
-  const name = (await $.store.get(`using:${await $.session.id()}`)) as string | undefined
-  if (!held || !name) return
-  const login = name === (await current($)) ? await liveLogin($) : await slot($, name)
-  const tok = accessToken(login?.creds)
-  if (tok && tok !== held) await $.env.set('ANTHROPIC_AUTH_TOKEN', tok)
+  const name = await using($)
+  if (!held || !name || name === API) return
+  const tok = accessToken((await loginOf($, name))?.creds)
+  // A switch meanwhile set (or dropped) its own token: never put this one back over it.
+  if (tok && tok !== held && (await $.env.get('ANTHROPIC_AUTH_TOKEN')) === held && (await using($)) === name) await $.env.set('ANTHROPIC_AUTH_TOKEN', tok)
 }
 
 /** Makes `name`'s slot the live login. */
 async function load($: EngineInterface, name: string, login: Login) {
-  await writeLive($, login.creds)
+  // Unreadable (over 4 MiB, half-written): stop before anything changes, never write it back without the rest.
   const path = await configPath($)
-  const config = JSON.parse(await $.fs.read(path).catch(() => '{}'))
-  await $.fs.write(path, `${JSON.stringify({ ...config, oauthAccount: login.oauthAccount }, null, 2)}\n`)
+  JSON.parse(await $.fs.read(path))
+  const raw = await readLive($)
+  await writeLive($, JSON.stringify({ ...JSON.parse(raw ?? '{}'), claudeAiOauth: JSON.parse(login.creds).claudeAiOauth }))
+  try {
+    const config = JSON.parse(await $.fs.read(path)) // again: what Claude Code wrote meanwhile stays
+    await $.fs.write(path, `${JSON.stringify({ ...config, oauthAccount: login.oauthAccount }, null, 2)}\n`)
+  } catch (err) {
+    if (raw) await writeLive($, raw) // never one account's login under another's account
+    throw err
+  }
 }
 
 async function rows($: EngineInterface): Promise<Row[]> {
@@ -318,19 +402,28 @@ function listText(list: Row[]): string {
 let band: { name: string; email?: string; limits?: Limit[]; cache?: number; isInStatusLine: boolean } | undefined
 
 async function show($: EngineInterface) {
-  const name = await active($)
-  const cache = hitRate((await $.store.get(`cache:${await $.session.id()}`)) as Cache | undefined)
-  const email = name === API ? await apiLabel($) : (await liveLogin($))?.oauthAccount?.emailAddress
-  band = { name, email, limits: name === API ? undefined : await limits($, name), cache, isInStatusLine: await statusLinePrints($) }
-  await writeStatus($)
-  $.ui.invalidate('ui.render')
+  try {
+    const name = await active($)
+    const cache = hitRate((await $.store.get(`cache:${await $.session.id()}`)) as Cache | undefined)
+    const email = name === API ? await apiLabel($) : (await loginOf($, name))?.oauthAccount?.emailAddress
+    band = { name, email, limits: name === API ? undefined : await limits($, name), cache, isInStatusLine: await statusLinePrints($) }
+    await writeStatus($)
+    $.ui.invalidate('ui.render')
+  } catch {
+    // The Keychain or ~/.claude.json unreadable for a moment: the last row stands.
+  }
 }
 
-/** A status line that prints the file (its command names it, or it's ccstatusline and its config does) shows the row itself. */
+/**
+ * A status line that prints the file (its command names it, or it's ccstatusline and its config does) shows the row itself.
+ * The one in force is the most specific set: the project's local settings, then the project's, then the user's.
+ */
 async function statusLinePrints($: EngineInterface) {
   const h = await home($)
-  const settings = await $.fs.read(`${h}/.claude/settings.json`).then(JSON.parse).catch(() => ({}))
-  const cmd: string = settings.statusLine?.command ?? ''
+  const root = await $.session.root().catch(() => undefined) // where Claude Code reads project settings: not moved by a shell cd
+  const paths = [root && `${root}/.claude/settings.local.json`, root && `${root}/.claude/settings.json`, `${h}/.claude/settings.json`]
+  const lines = await Promise.all(paths.map(p => (p ? $.fs.read(p).then(s => JSON.parse(s).statusLine).catch(() => undefined) : undefined)))
+  const cmd: string = lines.find(Boolean)?.command ?? ''
   if (cmd.includes('profile-status')) return true
   return cmd.includes('ccstatusline') && (await $.fs.read(`${h}/.config/ccstatusline/settings.json`).catch(() => '')).includes('profile-status')
 }
@@ -340,7 +433,8 @@ const level = (p: number) => (p >= 80 ? 'error' : p >= 50 ? 'warning' : 'success
 
 /** One bar per plan window: its label, percent used, cells filled, colour and time to reset. */
 function meters(list: Limit[] | undefined, now: number) {
-  return (list ?? []).map(l => {
+  const order = (kind: string) => (Object.keys(WINDOWS).indexOf(kind) + 1 || 99)
+  return [...(list ?? [])].sort((a, b) => order(a.kind) - order(b.kind)).map(l => {
     const p = Math.min(Math.round(l.percentUsed), 100)
     return { kind: l.kind, label: WINDOWS[l.kind] ?? l.kind, p, fill: Math.round((p / 100) * BAR), color: level(p), reset: until(l.resetsAt, now) }
   })
@@ -348,6 +442,8 @@ function meters(list: Limit[] | undefined, now: number) {
 
 const ANSI: Record<string, string> = { success: '32', warning: '33', error: '31', subtle: '90', bold: '1', accent: '36' }
 const paint = (style: string, text: string) => `\x1b[${ANSI[style]}m${text}\x1b[0m`
+
+let compacted: { sid: string; tokens: number } | undefined // the size after this conversation's last compaction, till the engine measures again
 
 // ponytail: every open session rewrites the same small file; a status line can rarely catch it mid-write.
 async function writeStatus($: EngineInterface) {
@@ -365,7 +461,7 @@ async function writeStatus($: EngineInterface) {
   // This session's whole status line, which profile-statusline.sh prints.
   const sid = await $.session.id()
   const top = await Promise.all([$.session.model(), $.session.usage(), $.store.get(`cache:${sid}`)])
-    .then(([model, use, cache]) => sessionLine(model, use.context, cache as Cache | undefined))
+    .then(([model, u, cache]) => sessionLine(model, compacted?.sid === sid ? { window: u.context.window, tokens: compacted.tokens } : u.context, cache as Cache | undefined))
     .catch(() => undefined)
   await $.fs.write(`${h}/.claude/profile-statusline/${sid}.txt`, `${top ? `${top}\n` : ''}${line}\n`)
 }
@@ -382,6 +478,7 @@ function modelName(id: string) {
 /** The session's input tokens, and how many of them were read from the prompt cache. */
 type Cache = { read: number; input: number }
 const hitRate = (c?: Cache) => (c?.input ? Math.round((c.read / c.input) * 100) : undefined)
+let counting: Promise<unknown> = Promise.resolve() // turn.complete's adds to `cache:<sid>`, one at a time
 
 /**
  * ccstatusline's line: model, context used, the prompt cache's hit rate, and a context bar.
@@ -408,7 +505,9 @@ field() { printf '%s' "$in" | sed -n "s/.*\\"$1\\"[[:space:]]*:[[:space:]]*$2.*/
 id=$(field session_id '"\\([^"]*\\)"')
 effort=$(field effort '{[[:space:]]*"level"[[:space:]]*:[[:space:]]*"\\([a-z0-9]*\\)"')
 [ -n "$effort" ] && effort=$(printf '\\033[90m | \\033[0m\\033[35mEffort: %s\\033[0m' "$effort")
-sed "s/@EFFORT@/$effort/" "$HOME/.claude/profile-statusline/$id.txt" 2>/dev/null || true
+f="$HOME/.claude/profile-statusline/$id.txt"
+# row: this session's account row alone, for a status line of your own (ccstatusline's Custom Command)
+if [ "$1" = row ]; then tail -n 1 "$f" 2>/dev/null; else sed "s/@EFFORT@/$effort/" "$f" 2>/dev/null; fi || true
 `
 
 /**
@@ -417,10 +516,11 @@ sed "s/@EFFORT@/$effort/" "$HOME/.claude/profile-statusline/$id.txt" 2>/dev/null
  */
 async function claimStatusLine($: EngineInterface) {
   if ((await $.store.get('statusLineClaimed')) || (await platform($)) === 'win') return
-  await $.store.set('statusLineClaimed', true)
   const path = `${await home($)}/.claude/settings.json`
-  const settings = await $.fs.read(path).then(JSON.parse).catch(() => undefined) // unreadable: leave it be
-  if (!settings || settings.statusLine) return
+  const settings = await $.fs.read(path).then(JSON.parse).catch(() => undefined) // unreadable: leave it be, look again next time
+  if (!settings) return
+  await $.store.set('statusLineClaimed', true)
+  if (settings.statusLine) return
   settings.statusLine = { type: 'command', command: 'sh ~/.claude/profile-statusline.sh', refreshInterval: 10 }
   await $.fs.write(path, `${JSON.stringify(settings, null, 2)}\n`)
   $.ui.toast('Status line set to the profile plugin\'s: remove "statusLine" from ~/.claude/settings.json to undo')
@@ -435,38 +535,107 @@ function until(iso: string | undefined, now: number): string | undefined {
   return d ? `${d}d ${h}h` : h ? `${h}h ${m % 60}m` : `${m}m`
 }
 
+// The add in progress, in a file every window reads (it outlives a plugin reload); `{}` once over.
+type Adding = { name: string; prev: string; prevAccount?: Login['oauthAccount']; until: number; pid?: string }
+const addingFile = async ($: EngineInterface) => `${await home($)}/.claude/profile-adding.json`
+const marker = async ($: EngineInterface): Promise<Adding | undefined> => $.fs.read(await addingFile($)).then(JSON.parse).catch(() => undefined)
+
+/** The add any window has in progress, till it gives up. */
+async function adding($: EngineInterface): Promise<Adding | undefined> {
+  const m = await marker($)
+  return m && m.until > (await $.clock.now()) ? m : undefined
+}
+
+/** Ends this process's add, for every window. */
+async function endAdd($: EngineInterface) {
+  await $.fs.write(await addingFile($), '{}')
+  await $.env.set('CLAUDE_PROFILE_ADDING', undefined)
+}
+
 /**
  * `claude auth login` replaces the live login; once it has, copy it into the new
- * account's slot and put the previous account back. Gives up after 10 minutes.
+ * account's slot and put the previous account back. Gives up after 10 minutes, or
+ * once the add is no longer marked (removed).
  */
-function watchSignIn($: EngineInterface, name: string, prev: string, prevToken: string | undefined) {
-  let ticks = 0
-  const timer = $.clock.every(3000, () => void (async () => {
-    if (++ticks > 200) return (pending.delete(name), timer.cancel())
-    const live = await liveLogin($)
-    const tok = accessToken(live?.creds)
-    if (!live || !tok || tok === prevToken || !live.oauthAccount?.emailAddress) return
+function watchSignIn($: EngineInterface, name: string) {
+  let isBusy = false
+  let isSaved = false // the new account's slot written; putting the previous one back is what's left
+  let fresh: string | undefined // the previous account's credential, changed since the add: a refresh, or this sign-in written before its account
+  const end = async (toast: string) => {
     timer.cancel()
-    await writeSlot($, name, JSON.stringify(live))
     pending.delete(name)
-    const back = await slot($, prev)
-    if (back) await load($, prev, back)
-    await reconnectRemote($)
-    $.ui.toast(`✓ ${name} signed in as ${live.oauthAccount.emailAddress} · /profile ${name} to switch`, { timeoutMs: 8000 })
+    await endAdd($)
+    $.ui.toast(toast, { timeoutMs: 8000 })
+  }
+  const timer = $.clock.every(3000, () => void (async () => {
+    if (isBusy) return
+    isBusy = true
+    try {
+      const m = await marker($)
+      if (m?.name !== name) {
+        pending.delete(name)
+        return timer.cancel() // removed
+      }
+      const live = await liveLogin($)
+      const back = await slot($, m.prev)
+      const tok = accessToken(live?.creds)
+      const isPrev = !!live && sameAccount(live.oauthAccount, m.prevAccount)
+      if (m.until <= (await $.clock.now())) {
+        if (isPrev && tok !== accessToken(back?.creds)) await save($, m.prev) // a window refreshed it meanwhile
+        return end(isSaved
+          ? `✓ ${name} is saved, but ${m.prev} couldn't be put back · /profile ${m.prev} to switch back`
+          : `No new sign-in for ${name} in 10 minutes · /profile add ${name} to try again`)
+      }
+      if (!live || !tok || !live.oauthAccount?.emailAddress) return
+      if (isPrev || tok === accessToken(back?.creds)) { // still the previous account, or the new one written but not its credential
+        if (isPrev && tok !== accessToken(back?.creds)) fresh = live.creds
+        if (!isPrev || (await loginRunning($, m.pid))) return
+        // The sign-in finished as the account you're on: its new credential is that account's.
+        if (fresh) await save($, m.prev)
+        await reconnectRemote($)
+        return end(`That sign-in is ${m.prev}'s account, the one you're on, so ${name} wasn't saved · /profile add ${name} and sign in as another account (a private window helps)`)
+      }
+      // An account saved under another name already: two copies, and refreshing one revokes the other.
+      let dup: string | undefined
+      for (const other of await names($)) if (other !== name && other !== API && sameAccount(live.oauthAccount, (await slot($, other))?.oauthAccount)) dup = other
+      if (!dup && !isSaved) {
+        await writeSlot($, name, JSON.stringify(own(live)))
+        isSaved = true
+      }
+      // A refresh of the previous account seen meanwhile is the copy put back; this sign-in's own credential seen early isn't.
+      const prev = back && fresh && accessToken(fresh) !== tok ? own({ ...back, creds: fresh }) : back
+      if (prev && prev !== back) await writeSlot($, m.prev, JSON.stringify(prev))
+      if (prev) await load($, m.prev, prev)
+      await reconnectRemote($)
+      await end(dup
+        ? `That sign-in is ${dup}'s account, so ${name} wasn't saved · /profile add ${name} and sign in as another account (a private window helps)`
+        : `✓ ${name} signed in as ${live.oauthAccount.emailAddress} · /profile ${name} to switch`)
+    } catch {
+      // A locked Keychain, a half-written ~/.claude.json: the next tick tries again.
+    } finally {
+      isBusy = false
+    }
   })())
 }
 
 async function add($: EngineInterface, name: string): Promise<string> {
   if (name === API) return setupApi($)
-  if (!NAME.test(name)) return '! Usage: /profile add <name>  (letters, digits, . _ -)'
+  if (!NAME.test(name) || VERBS.includes(name)) return `! Usage: /profile add <name>  (letters, digits, . _ -; not ${VERBS.join(', ')})`
+  const busy = await adding($) // in any window
+  if (busy) return `! The sign-in for ${busy.name} isn't finished · finish it first, or wait for it to give up`
   if (await slot($, name)) return `! ${name} is already signed in · /profile ${name} to switch, /profile remove ${name} to start over`
+  const live = await liveLogin($)
+  if (live && !live.oauthAccount) return `! Can't read your account from ~/.claude.json, so it can't be saved before the sign-in replaces it · nothing changed`
   const cur = await current($)
+  if (name === cur) return `! ${name} is the login you're on · pick another name for the new account`
   await save($, cur) // the login is about to replace it
-  const prevToken = accessToken((await liveLogin($))?.creds)
+  const prevAccount = live?.oauthAccount
   const log = `${await home($)}/.claude/cc-swap-login.log`
-  await startLogin($, log)
+  const pid = await startLogin($, log)
+  await $.fs.write(await addingFile($), JSON.stringify({ name, prev: cur, prevAccount, until: (await $.clock.now()) + 600_000, pid }))
+  await $.env.set('CLAUDE_PROFILE_ADDING', name) // this process's: a reload watches it again
   pending.add(name)
-  watchSignIn($, name, cur, prevToken)
+  watchSignIn($, name)
   return [
     `✓ Sign-in for ${name} opened in your browser`,
     `Sign in there as the account you want (a private window avoids reusing your current claude.ai login).`,
@@ -474,30 +643,45 @@ async function add($: EngineInterface, name: string): Promise<string> {
   ].join('\n')
 }
 
-async function use($: EngineInterface, name: string): Promise<string> {
-  if (name === API) return useApi($, false)
+let switching: Promise<unknown> = Promise.resolve()
+
+/** One switch at a time in this window (a timer, a prompt, a failover): each reads the state the last left. */
+function serial<T>(f: () => Promise<T>): Promise<T> {
+  const run = switching.then(f)
+  switching = run.catch(() => undefined)
+  return run
+}
+
+const use = ($: EngineInterface, name: string) => serial(() => (name === API ? switchToApi($, false) : switchTo($, name)))
+const useApi = ($: EngineInterface, isAuto: boolean) => serial(() => switchToApi($, isAuto))
+
+async function switchTo($: EngineInterface, name: string): Promise<string> {
   const wasApi = await onApi($)
+  if (name === (await active($))) return `✓ Already on ${name}`
   const cur = await current($)
-  if (name === cur && !wasApi) return `✓ Already on ${name}`
   const login = name === cur ? await liveLogin($) : await slot($, name)
   if (!login) return `! ${name} isn't signed in · /profile add ${name}`
-  if (wasApi) await leaveApi($)
+  const busy = name !== cur && (await adding($)) // in any window: its sign-in would be saved as this switch's account
+  if (busy) return `! The sign-in for ${busy.name} isn't finished · switch once it is`
   if (name !== cur) {
     await save($, cur)
     await load($, name, login)
     await reconnectRemote($)
   }
-  // Back on the login this session started with: drop the token so usage and email return.
-  const startedOn = (await $.store.get(`startedOn:${await $.session.id()}`)) as string | undefined
-  await $.env.set('ANTHROPIC_AUTH_TOKEN', name === startedOn ? undefined : accessToken(login.creds))
-  const using = `using:${await $.session.id()}`
-  await (name === startedOn ? $.store.delete(using) : $.store.set(using, name))
+  if (wasApi) await leaveApi($)
+  // Back on the login this process loaded: drop the token, so its own usage and email return.
+  const isStart = name === (await startedOn($))
+  await $.env.set('ANTHROPIC_AUTH_TOKEN', isStart ? undefined : accessToken(login.creds))
+  await $.env.set('CLAUDE_PROFILE_USING', isStart ? undefined : name)
   await planUsage($, true)
   await show($)
   const email = login.oauthAccount?.emailAddress
+  const isExpired = !isStart && expiry(login.creds) <= (await $.clock.now())
   return [
     `✓ Switched to ${name}${email ? ` (${email})` : ''}`,
-    `This session uses it from your next message, and its plan usage shows here after that; reopen Claude Code for /usage, email and connectors.`,
+    isExpired
+      ? `Its saved login has expired, as no window used it for hours: reopen Claude Code to renew it; this session can't use it till then.`
+      : `This session uses it from your next message, and its plan usage shows here after that; reopen Claude Code for /usage, email and connectors.`,
   ].join('\n')
 }
 
@@ -506,14 +690,23 @@ async function use($: EngineInterface, name: string): Promise<string> {
 // session sends it, so other windows keep the live login and its connectors.
 const KEY_PANE = 'profile-api-key'
 
-/** Whether this session bills the `api` profile. */
-const onApi = async ($: EngineInterface) => (await $.store.get(`using:${await $.session.id()}`)) === API
+// What this process switched to, and the login it loaded, live in its environment like
+// the token they go with: a /clear (a new session id) keeps them, a resume (a new process) starts over.
+const using = ($: EngineInterface) => $.env.get('CLAUDE_PROFILE_USING')
+const startedOn = ($: EngineInterface) => $.env.get('CLAUDE_PROFILE_STARTED_ON')
 
-/** Where this session's requests go: `api`, or the live login's account. */
-const active = async ($: EngineInterface) => ((await onApi($)) ? API : current($))
+/** Whether this session bills the `api` profile. */
+const onApi = async ($: EngineInterface) => (await using($)) === API
+
+/** Where this session's requests go: what it switched to, else the login it loaded (not what another window made live). */
+const active = async ($: EngineInterface) => (await using($)) ?? (await startedOn($)) ?? current($)
 
 async function apiKey($: EngineInterface): Promise<string | undefined> {
-  return JSON.parse((await readSlot($, API)) ?? '{}').apiKey
+  try {
+    return JSON.parse((await readSlot($, API)) ?? '{}').apiKey
+  } catch {
+    return undefined
+  }
 }
 
 const apiLabel = async ($: EngineInterface) => `API credit · key …${(await apiKey($))?.slice(-4)}`
@@ -525,9 +718,13 @@ async function setupApi($: EngineInterface): Promise<string> {
 
 /** Enter in the paste box: the key out of whatever was pasted (a bare key, quoted, or `ANTHROPIC_API_KEY=…`). */
 async function saveApiKey($: EngineInterface, text: string) {
-  const key = /sk-ant-[\w-]+/.exec(text)?.[0]
+  const key = /sk-ant-api\d+-[\w-]+/.exec(text)?.[0]
   if (!key) return $.ui.toast('No Console API key (sk-ant-…) in that · paste it again, or Esc to cancel', { timeoutMs: 6000 })
   await writeSlot($, API, JSON.stringify({ apiKey: key }))
+  if (await onApi($)) {
+    await approveKey($, key)
+    await $.env.set('ANTHROPIC_API_KEY', key)
+  }
   await $.ui.close({ id: KEY_PANE })
   $.ui.toast(`✓ ${API} saved: Console API key …${key.slice(-4)} · billed only once every account is out of usage`, { timeoutMs: 8000 })
 }
@@ -535,7 +732,7 @@ async function saveApiKey($: EngineInterface, text: string) {
 /** Claude Code sends an env API key only once approved: its last 20 characters in ~/.claude.json, as its own prompt records them. */
 async function approveKey($: EngineInterface, key: string) {
   const path = await configPath($)
-  const config = JSON.parse(await $.fs.read(path).catch(() => '{}'))
+  const config = JSON.parse(await $.fs.read(path)) // unreadable: no switch, rather than a config without the rest
   const { approved = [], rejected = [] } = config.customApiKeyResponses ?? {}
   const tail = key.slice(-20)
   if (approved.includes(tail)) return
@@ -547,10 +744,13 @@ async function approveKey($: EngineInterface, key: string) {
 const sends = ($: EngineInterface) => $.session.authorize().then(a => a?.kind, () => undefined)
 
 /** Bills this session to the `api` profile; `isAuto` when every account ran out, so it comes back by itself. */
-async function useApi($: EngineInterface, isAuto: boolean): Promise<string> {
+async function switchToApi($: EngineInterface, isAuto: boolean): Promise<string> {
   const key = await apiKey($)
-  if (!key) return `! No API credit set up · copy your Console API key, then /profile add ${API}`
-  if (await onApi($)) return `✓ Already on ${API}`
+  if (!key) return `! No API credit set up · /profile add ${API} and paste your Console API key`
+  if (await onApi($)) {
+    if (!isAuto) await $.env.set('CLAUDE_PROFILE_API_AUTO', undefined) // chosen now: it stays
+    return `✓ Already on ${API}`
+  }
   const held = await $.env.get('ANTHROPIC_AUTH_TOKEN')
   await approveKey($, key)
   await $.env.set('ANTHROPIC_AUTH_TOKEN', undefined) // it outranks ANTHROPIC_API_KEY
@@ -562,9 +762,8 @@ async function useApi($: EngineInterface, isAuto: boolean): Promise<string> {
     await $.env.set('ANTHROPIC_AUTH_TOKEN', held)
     return `! Claude Code didn't take the key …${key.slice(-4)} · still on ${await current($)}`
   }
-  const sid = await $.session.id()
-  await $.store.set(`using:${sid}`, API)
-  await $.store.set(`apiAuto:${sid}`, isAuto)
+  await $.env.set('CLAUDE_PROFILE_USING', API)
+  await $.env.set('CLAUDE_PROFILE_API_AUTO', isAuto ? '1' : undefined)
   await show($)
   return [
     `✓ Switched to ${API} (${await apiLabel($)})`,
@@ -574,31 +773,31 @@ async function useApi($: EngineInterface, isAuto: boolean): Promise<string> {
 
 async function leaveApi($: EngineInterface) {
   await $.env.set('ANTHROPIC_API_KEY', undefined)
-  await $.store.delete(`apiAuto:${await $.session.id()}`)
+  await $.env.set('CLAUDE_PROFILE_API_AUTO', undefined)
 }
 
 /** Back from API credit taken by itself, once an account has usage again. */
 async function backFromApi($: EngineInterface) {
-  if (!(await $.store.get(`apiAuto:${await $.session.id()}`)) || !(await onApi($))) return
+  if (!(await $.env.get('CLAUDE_PROFILE_API_AUTO')) || !(await onApi($))) return
   const { to } = await spare($, await $.clock.now())
-  if (!to) return
-  await use($, to)
-  $.ui.toast(`${to} has usage again · back from API credit`, { timeoutMs: 8000 })
+  if (to && (await use($, to)).startsWith('✓ Switched')) $.ui.toast(`${to} has usage again · back from API credit`, { timeoutMs: 8000 })
 }
 
-/** A window used up and not reset yet. */
-const isOut = (list: Limit[] | undefined, now: number) =>
-  !!list?.some(l => l.percentUsed >= 100 && (!l.resetsAt || Date.parse(l.resetsAt) > now))
+/** A window used up and not reset yet, with no extra usage left to go on with. */
+const isOut = (list: Limit[] | undefined, now: number, hasExtra: unknown) =>
+  !hasExtra && !!list?.some(l => l.percentUsed >= 100 && (!l.resetsAt || Date.parse(l.resetsAt) > now))
 
 /** The first signed-in account, in list order, with usage left and a token this session can use. */
 async function spare($: EngineInterface, now: number, skip?: string): Promise<{ to?: string; expired: string[] }> {
   const live = await current($)
+  const start = await startedOn($)
   const expired: string[] = []
   for (const name of await names($)) {
-    if (name === skip || name === API || isOut(await limits($, name), now)) continue
+    if (name === skip || name === API || isOut(await limits($, name), now, await $.store.get(`extra:${name}`))) continue
     const login = name === live ? await liveLogin($) : await slot($, name)
     // A saved login nothing refreshed for hours holds an expired token: this session can't use it.
-    if (login && expiry(login.creds) <= now) expired.push(name)
+    // The one it loaded can: switching back drops the token, and Claude Code refreshes its own.
+    if (login && name !== start && expiry(login.creds) <= now) expired.push(name)
     else if (login) return { to: name, expired }
   }
   return { expired }
@@ -610,10 +809,27 @@ async function secrets($: EngineInterface): Promise<string[]> {
   return all.filter((s): s is string => !!s && s.length >= 20)
 }
 
+/** `text` with every one of `hidden` blanked out. */
+const blank = (hidden: string[], text: string) => hidden.reduce((out, s) => out.split(s).join('[redacted]'), text)
+
 /** What this session sends, to tell whether another step switched meanwhile. */
 const credential = async ($: EngineInterface) => `${await $.env.get('ANTHROPIC_AUTH_TOKEN')}|${await $.env.get('ANTHROPIC_API_KEY')}`
 
 let failing: Promise<boolean> | undefined // parallel subagents hit the limit together: one switch
+let declined: string | undefined // the credential the person chose to stay on, till their next message
+
+/**
+ * Another step's switch, awaited inside short `$` calls: a hook's 10s budget stops only
+ * while one of its own is in flight, and that step may be waiting on the person.
+ */
+async function awaitSwitch($: EngineInterface, switched: Promise<boolean>, signal: AbortSignal): Promise<boolean> {
+  const nap = (await platform($)) === 'win' ? ['powershell', '-NoProfile', '-Command', 'Start-Sleep 2'] : ['sleep', '2']
+  for (;;) {
+    if (signal.aborted) return false
+    const r = await Promise.race([switched, $.process.run(nap).then(() => undefined, () => switched)])
+    if (r !== undefined) return r
+  }
+}
 
 /**
  * The live account's plan is used up: switch to a signed-in one whose isn't, else to
@@ -622,48 +838,65 @@ let failing: Promise<boolean> | undefined // parallel subagents hit the limit to
  */
 async function failover($: EngineInterface): Promise<boolean> {
   if (await onApi($)) return false // API credit is the last stop
+  const isGoal = await $.store.get(`goal:${await $.session.id()}`)
+  if (!isGoal && declined === (await credential($))) return false // asked already: steps in flight ran out too
   const now = await $.clock.now()
-  const isSwitched = !!(await $.env.get('ANTHROPIC_AUTH_TOKEN'))
-  const rateLimits = (isSwitched ? await planUsage($, true) : undefined) ?? (await $.session.usage()).rateLimits
-  if (!isOut(rateLimits, now)) return false // failed for another reason
-  const from = await current($)
-  await $.store.set(`limits:${from}`, rateLimits) // so no fallback picks it till it resets
+  const from = await active($)
+  // The plan's reading says whether extra usage is left. Switched, the engine's reading
+  // may be the login this process loaded: no plan reading, no telling.
+  let rateLimits = await planUsage($, true)
+  if (!rateLimits?.length) rateLimits = (await using($)) ? await limits($, from) : (await $.session.usage()).rateLimits
+  if (!isOut(rateLimits, now, await $.store.get(`extra:${from}`))) return false // failed for another reason
+  // So no fallback picks it till it resets; a window that doesn't say when has reset by its full length.
+  const span = (kind: string) => (kind === 'seven_day' ? 7 * 24 : 5) * 3_600_000
+  await $.store.set(`limits:${from}`, rateLimits!.map(l => ({ ...l, resetsAt: l.resetsAt ?? new Date(now + span(l.kind)).toISOString() })))
   const { to, expired } = await spare($, now, from)
   const key = await apiKey($)
+  const renew = expired.length ? ` · ${expired.join(', ')}: saved login expired, /profile to it and reopen Claude Code to renew it` : ''
   if (!to && !key) {
-    $.ui.toast(expired.length
-      ? `${from} is out of usage · ${expired.join(', ')}: saved login expired, /profile to it and reopen Claude Code to renew it`
-      : `${from} is out of usage, and so is every other account`, { timeoutMs: 8000 })
+    $.ui.toast(expired.length ? `${from} is out of usage${renew}` : `${from} is out of usage, and so is every other account`, { timeoutMs: 8000 })
     return false
   }
   // A goal takes the next account, API credit only after the last; asked, either is offered.
   let choice = to ?? API
-  const isGoal = await $.store.get(`goal:${await $.session.id()}`)
   if (!isGoal) {
     const credit = `Console key …${key?.slice(-4)}, billed per token`
-    const question = !to ? `${from} and every other account are out of usage. Continue on API credit (${credit})?`
+    const question = !to ? `${from} ${expired.length ? `is out of usage, and ${expired.join(', ')} needs a reopen to renew its saved login` : 'and every other account are out of usage'}. Continue on API credit (${credit})?`
       : key ? `${from} is out of usage. Continue on ${to}, or on API credit (${credit})?`
       : `${from} is out of usage. Switch to ${to} and continue?`
     const options = [...(to ? [`Switch to ${to}`] : []), ...(key ? ['Use API credit'] : []), `Stay on ${from}`]
     const answer = await $.ui.ask(question, { header: 'Usage', options }).catch(() => undefined)
     if (answer === 'Use API credit') choice = API
-    else if (answer !== `Switch to ${to}`) return false
+    else if (answer !== `Switch to ${to}`) {
+      declined = await credential($)
+      return false
+    }
   }
   // Chosen over an account with usage left, API credit stays till /profile <name>.
-  if (choice === API) {
-    if (!(await useApi($, !to)).startsWith('✓')) return false
-  } else await use($, choice)
+  const said = choice === API ? await useApi($, !to) : await use($, choice)
+  if (!said.startsWith('✓')) {
+    $.ui.toast(`${from} is out of usage, and the switch didn't happen: ${said.replace(/^! /, '')}`, { timeoutMs: 8000 })
+    return false
+  }
   if (isGoal) {
-    $.ui.toast(choice !== API ? `${from} is out of usage · switched to ${choice} to keep the goal going` : 'Every account is out of usage · on API credit to keep the goal going', { timeoutMs: 8000 })
+    $.ui.toast(choice !== API ? `${from} is out of usage · switched to ${choice} to keep the goal going` : `${expired.length ? `${from} is out of usage` : 'Every account is out of usage'} · on API credit to keep the goal going${renew}`, { timeoutMs: 8000 })
   }
   return true
 }
 
 async function remove($: EngineInterface, name: string): Promise<string> {
-  if (!(await names($)).includes(name)) return '! Usage: /profile remove <name>'
-  if ((await current($)) === name || (await active($)) === name) return `! ${name} is the active login · switch away first`
-  await deleteSlot($, name)
+  const add = await adding($)
+  const isAdding = add?.name === name // whichever window started it
+  if (!isAdding && !(await names($)).includes(name)) return '! Usage: /profile remove <name>'
+  if (!isAdding && ((await current($)) === name || (await active($)) === name)) return `! ${name} is the active login · switch away first`
+  if (!(await deleteSlot($, name))) return `! Couldn't remove ${name}'s saved login · nothing changed`
   pending.delete(name)
+  await $.store.delete(`limits:${name}`) // a new account added under the name starts without them
+  await $.store.delete(`extra:${name}`)
+  if (isAdding) { // its sign-in watch stops, and the browser sign-in with it
+    if (add.pid && (await loginRunning($, add.pid))) await $.process.run(['kill', add.pid]).catch(() => undefined)
+    await endAdd($)
+  }
   return `✓ Removed ${name}`
 }
 
@@ -680,12 +913,26 @@ async function pick($: EngineInterface): Promise<string | undefined> {
   }
   const i = labels.indexOf(answer)
   if (i >= 0) return use($, others[i]!.name)
-  if (answer === ADD) {
+  if (answer === ADD) { // the same flows as /profile add <name> and /profile add api
+    const kind = await $.ui.ask('Add which kind of account?', { header: 'Add', options: [ADD_SUB, ADD_API] }).catch(() => undefined)
+    if (!kind) return undefined
+    if (kind !== ADD_SUB) return add($, kind === ADD_API ? API : kind.trim()) // typed under Other: a name
     const name = await $.ui.ask('Name for the new account?', { header: 'Name', options: ['work', 'personal'] }).catch(() => undefined)
     return name ? add($, name.trim()) : undefined
   }
-  const typed = answer.trim() // typed under Other: switch to it, or add it
-  return (await names($)).includes(typed) ? use($, typed) : add($, typed)
+  const typed = answer.trim() // typed under Other: an account to switch to
+  return (await names($)).includes(typed) ? use($, typed) : `! No account ${typed} · /profile add ${NAME.test(typed) ? typed : '<name>'} to sign one in`
+}
+
+async function profile($: EngineInterface, args: string): Promise<string> {
+  const [verb = '', ...rest] = args.trim().split(/\s+/)
+  const name = rest.join(' ')
+  if (verb === 'add') return add($, name)
+  if (verb === 'remove') return remove($, name)
+  if (verb === 'list' || verb === 'status') return listText(await rows($))
+  if (!verb) return (await pick($)) ?? listText(await rows($))
+  if ((await names($)).includes(verb)) return use($, verb)
+  return `! No account ${verb} · /profile add ${NAME.test(verb) ? verb : '<name>'} to sign one in`
 }
 
 export const register: Register = on => {
@@ -695,43 +942,67 @@ export const register: Register = on => {
       description: 'Switch your Claude login between accounts',
       argumentHint: '[name | add <name> | add api | remove <name> | list]',
     })
-    // The login this process loaded; a reload mid-switch (token set) keeps the first answer.
-    const key = `startedOn:${await $.session.id()}`
-    if (!(await $.env.get('ANTHROPIC_AUTH_TOKEN')) && !(await $.store.get(key))) await $.store.set(key, await current($))
     $.ui.status(undefined) // versions before 0.2.4 pinned a status line instead of the band
+    await watchLogin($) // first: its timers redraw the row and sync the token whatever fails below
+    const mine = await $.env.get('CLAUDE_PROFILE_ADDING') // an add this process started before a reload
+    const m = await adding($)
+    if (mine && !pending.has(mine) && m?.name === mine && (await $.session.usage()).startedAt <= m.until - 600_000) {
+      pending.add(mine)
+      watchSignIn($, mine)
+    }
+    // The login this process loaded; a reload mid-switch (token set) keeps the first answer. A Keychain
+    // or ~/.claude.json caught mid-write gets a second try; failing that the live login stands in.
+    if (!(await $.env.get('ANTHROPIC_AUTH_TOKEN')) && !(await startedOn($))) {
+      const first = await current($).catch(() => current($)).catch(() => undefined)
+      if (first) await $.env.set('CLAUDE_PROFILE_STARTED_ON', first)
+    }
     const h = await home($)
-    await $.fs.write(`${h}/.claude/profile-statusline.sh`, STATUSLINE)
-    await claimStatusLine($)
+    await $.fs.write(`${h}/.claude/profile-statusline.sh`, STATUSLINE).catch(() => undefined)
+    await claimStatusLine($).catch(() => undefined)
     // A file per session: drop the ones nothing has written for a week.
-    if ((await platform($)) !== 'win') void $.process.run(['find', `${h}/.claude/profile-statusline`, '-name', '*.txt', '-mtime', '+7', '-delete']).catch(() => undefined)
+    if ((await platform($).catch(() => 'win')) !== 'win') void $.process.run(['find', `${h}/.claude/profile-statusline`, '-name', '*.txt', '-mtime', '+7', '-delete']).catch(() => undefined)
     await show($)
-    await watchLogin($)
     return next(e)
   })
 
   on('session.measure', async ($, e, next) => {
     const r = await next(e)
+    if (e.changed.includes('context')) compacted = undefined // measured since
     if (await onApi($)) await writeStatus($)
-    else if (await $.env.get('ANTHROPIC_AUTH_TOKEN')) {
+    else if (await using($)) {
       await planUsage($) // a switched token: the engine's reading may be the login it started with
       await show($)
     } else if (e.changed.includes('rateLimits') && e.rateLimits.length) {
-      await $.store.set(`limits:${await current($)}`, e.rateLimits)
+      await $.store.set(`limits:${await active($)}`, e.rateLimits) // the login this process loaded, whatever another window made live
       await show($)
     } else await writeStatus($) // context or cost
     return r
   })
 
-  // The session's prompt-cache hit rate, for the status line.
+  // /compact isn't a turn, so no session.measure follows it: show the smaller context now.
+  on('session.compact', async ($, e, next) => {
+    const r = await next(e)
+    if (r.messages && !e.agentId && e.trigger !== 'precompute') {
+      // The engine may still report the old size; with no recorded size, its own figure stands.
+      compacted = r.tokensAfter === undefined ? undefined : { sid: await $.session.id(), tokens: r.tokensAfter }
+      await writeStatus($)
+    }
+    return r
+  })
+
+  // The session's prompt-cache hit rate, for the status line. Parallel subagents end
+  // together: one count at a time, each adding to what the last stored.
   on('turn.complete', async ($, e, next) => {
     if (e.usage) {
       const key = `cache:${await $.session.id()}`
       const u = e.usage
-      const was = ((await $.store.get(key)) as Cache | undefined) ?? { read: 0, input: 0 }
-      await $.store.set(key, {
-        read: was.read + u.cache_read_input_tokens,
-        input: was.input + u.input_tokens + u.cache_read_input_tokens + u.cache_creation_input_tokens,
-      })
+      await (counting = counting.then(async () => {
+        const was = ((await $.store.get(key)) as Cache | undefined) ?? { read: 0, input: 0 }
+        await $.store.set(key, {
+          read: was.read + u.cache_read_input_tokens,
+          input: was.input + u.input_tokens + u.cache_read_input_tokens + u.cache_creation_input_tokens,
+        })
+      }).catch(() => undefined))
       await show($)
     }
     return next(e)
@@ -739,7 +1010,7 @@ export const register: Register = on => {
 
   // Remember that this session uses Remote Control, to reconnect it after a switch.
   on('command.run', { command: 'remote-control' }, async ($, e, next) => {
-    await $.store.set(`remote:${await $.session.id()}`, true)
+    await $.env.set('CLAUDE_PROFILE_REMOTE', '1')
     return next(e)
   })
 
@@ -751,7 +1022,11 @@ export const register: Register = on => {
       const held = await credential($)
       const r = yield* next(e)
       if (r.stopReason !== null || next.signal.aborted) return r
-      if (held === (await credential($)) && !(await (failing ??= failover($).finally(() => (failing = undefined))))) return r
+      await syncToken($).catch(() => undefined) // another window refreshed it, revoking this copy: go again on the fresh one
+      if (held !== (await credential($))) continue
+      const switched = failing ? await awaitSwitch($, failing, next.signal)
+        : await (failing = failover($).catch((err: Error) => ($.ui.toast(`Couldn't switch accounts: ${err.message}`, { timeoutMs: 8000 }), false)).finally(() => (failing = undefined)))
+      if (!switched || next.signal.aborted) return r
     }
   })
 
@@ -760,13 +1035,25 @@ export const register: Register = on => {
   // model or the transcript sees it. The command itself is left alone, so permission
   // rules still match it.
   on('tool.call', async ($, e, next) => {
+    const inherited = await secrets($) // what the tool's process starts with: a switch while it runs changes the env, not its output
     const r = await next(e)
-    const hidden = await secrets($)
+    // The model can set a goal itself; it runs unattended like a /goal.
+    if (e.tool === 'ProposeGoal' && !r.deny && !r.isError) await $.store.set(`goal:${await $.session.id()}`, true).catch(() => undefined)
+    const hidden = [...new Set([...inherited, ...(await secrets($))])]
+    if (!hidden.length) return r
     const raw = `${r.text ?? ''}${JSON.stringify(r.result ?? '')}`
     if (!hidden.some(s => raw.includes(s))) return r
-    const blank = (t: string) => hidden.reduce((out, s) => out.split(s).join('[redacted]'), t)
-    if (r.isError) return { deny: blank(r.text ?? '') }
-    return { result: JSON.parse(blank(JSON.stringify(r.result))), context: r.context }
+    if (r.isError || r.result === undefined) return { deny: blank(hidden, r.text ?? JSON.stringify(r.result ?? '')) }
+    return { result: JSON.parse(blank(hidden, JSON.stringify(r.result))), context: r.context }
+  }).catch(($, e, next) => (next.error.kind === 're-entry' ? next(e) : { deny: "A plugin couldn't check this output for a credential, so it was withheld" })) // fails closed
+
+  // Rows no tool call carries (a Monitor's streamed lines, a settings hook's output) are blanked as they're kept.
+  on('session.append', async ($, e, next) => {
+    const hidden = await secrets($)
+    if (!hidden.length) return next(e) // on its own login: nothing of this session's rides in the environment
+    const raw = JSON.stringify(e.message.content)
+    if (!hidden.some(s => raw.includes(s))) return next(e)
+    return next({ ...e, message: { ...e.message, content: JSON.parse(blank(hidden, raw)) } })
   })
 
   // ponytail: a goal that ends by itself (met, impossible) is invisible to a plugin, so it
@@ -774,41 +1061,59 @@ export const register: Register = on => {
   on('command.run', { command: 'goal' }, async ($, e, next) => {
     const arg = e.args.trim()
     const key = `goal:${await $.session.id()}`
-    if (arg) await (/^(clear|stop|off|reset|none|cancel)$/i.test(arg) ? $.store.delete(key) : $.store.set(key, true))
+    const isClear = /^(clear|stop|off|reset|none|cancel)$/i.test(arg)
+    if (arg) await (isClear ? $.store.delete(key) : $.store.set(key, true))
+    // API credit the goal took by itself stops with it: the next refusal asks.
+    if (isClear) await serial(async () => {
+      if (!(await $.env.get('CLAUDE_PROFILE_API_AUTO')) || !(await onApi($))) return
+      await leaveApi($)
+      await $.env.set('CLAUDE_PROFILE_USING', undefined)
+      await show($)
+    })
     return next(e)
   })
 
-  on('command.run', { command: 'clear' }, async ($, e, next) => {
-    await $.store.delete(`goal:${await $.session.id()}`)
+  // A conversation ends (exit, /clear, a resume): its keys go, and the next one's status line is drawn.
+  on('session.end', async ($, e, next) => {
+    await $.store.delete(`goal:${e.sessionId}`).catch(() => undefined)
+    await $.store.delete(`cache:${e.sessionId}`).catch(() => undefined)
+    if (e.reason === 'clear' || e.reason === 'resume') $.clock.after(1000, () => void show($).catch(() => undefined))
     return next(e)
+  })
+
+  // /login here: this process now sends the new login, the one a switch back to drops the token for.
+  on('command.run', { command: 'login' }, async ($, e, next) => {
+    const r = await next(e)
+    const now = await current($).catch(() => undefined)
+    if (now) await $.env.set('CLAUDE_PROFILE_STARTED_ON', now)
+    await show($)
+    return r
+  })
+
+  // The model shows on the status line from the file: redraw it after /model.
+  on('command.run', { command: 'model' }, async ($, e, next) => {
+    const r = await next(e)
+    await writeStatus($).catch(() => undefined)
+    return r
   })
 
   on('command.run', { command: 'usage' }, async ($, e, next) => {
-    const cur = await current($)
-    const startedOn = await $.store.get(`startedOn:${await $.session.id()}`)
-    if (!(await $.env.get('ANTHROPIC_AUTH_TOKEN')) || cur === startedOn) return next(e)
-    return { text: await usagePanel($, cur) }
+    const name = await using($)
+    if (!name || name === API) return next(e)
+    await planUsage($)
+    return { text: await usagePanel($, name) }
   })
 
-  on('command.run', { command: 'profile' }, async ($, e) => {
-    const [verb = '', ...rest] = e.args.trim().split(/\s+/)
-    const name = rest.join(' ')
+  on('command.run', { command: 'profile' }, async ($, e) => ({ text: await profile($, e.args).catch((err: Error) => `! ${err.message}`) }))
 
-    if (verb === 'add') return { text: await add($, name) }
-    if (verb === 'remove') return { text: await remove($, name) }
-    if (verb === 'list' || verb === 'status') return { text: listText(await rows($)) }
-    if (!verb) return { text: (await pick($)) ?? listText(await rows($)) }
-    if ((await names($)).includes(verb)) return { text: await use($, verb) }
-    return { text: `! No account ${verb} · /profile add ${NAME.test(verb) ? verb : '<name>'} to sign one in` }
-  })
-
-  // Account names and verbs after `/profile `.
   on('prompt.submit', async ($, e, next) => {
+    declined = undefined
     await syncToken($).catch(() => undefined)
     await backFromApi($).catch(() => undefined)
     return next(e)
   })
 
+  // Account names and verbs after `/profile `.
   on('prompt.autocomplete', async ($, e, next) => {
     const m = /^\/profile\s+(?:(remove)\s+)?$/.exec(e.text.slice(0, e.start))
     if (!m) return next(e)
@@ -824,7 +1129,16 @@ export const register: Register = on => {
     // A status line shows only in the terminal; the desktop app keeps the row.
     if (!band || (band.isInStatusLine && e.surface === 'terminal') || e.props.hasSurvey) return next(e)
     const { Box, Text } = $.ui.resolve(e)
-    const windows = meters(band.limits, await $.clock.now()).map(m => (
+    const all = meters(band.limits, await $.clock.now())
+    const { name, email, cache } = band
+    // Wider than the column it would wrap: drop the email, then the countdowns, then the cache, then the 7d window.
+    const width = (d: number) => [
+      ['●', name, d < 1 && email],
+      ...(d < 4 ? all : all.slice(0, 1)).map(m => [m.label, '▰'.repeat(BAR), `${m.p}%`, d < 2 && m.reset && `↻ ${m.reset}`]),
+      ...(d < 3 && cache !== undefined ? [['Cache', `${cache}%`]] : []),
+    ].map(g => g.filter(Boolean).join(' ')).join(' │ ').length
+    const d = [0, 1, 2, 3].find(n => width(n) <= e.props.bodyColumns) ?? 4
+    const windows = (d < 4 ? all : all.slice(0, 1)).map(m => (
       <Box key={m.kind} gap={1}>
         <Text color="subtle">{m.label}</Text>
         <Box>
@@ -832,20 +1146,20 @@ export const register: Register = on => {
           <Text color="subtle">{'▱'.repeat(BAR - m.fill)}</Text>
         </Box>
         <Text color={m.color}>{`${m.p}%`}</Text>
-        {m.reset ? <Text color="subtle">{`↻ ${m.reset}`}</Text> : null}
+        {m.reset && d < 2 ? <Text color="subtle">{`↻ ${m.reset}`}</Text> : null}
       </Box>
     ))
     const groups = [
       <Box key="account" gap={1}>
         <Text color="success">●</Text>
-        <Text bold>{band.name}</Text>
-        {band.email && e.props.bodyColumns >= 90 ? <Text color="subtle">{band.email}</Text> : null}
+        <Text bold>{name}</Text>
+        {email && d < 1 ? <Text color="subtle">{email}</Text> : null}
       </Box>,
       ...windows,
-      ...(band.cache !== undefined ? [
+      ...(cache !== undefined && d < 3 ? [
         <Box key="cache" gap={1}>
           <Text color="subtle">Cache</Text>
-          <Text color={level(100 - band.cache)}>{`${band.cache}%`}</Text>
+          <Text color={level(100 - cache)}>{`${cache}%`}</Text>
         </Box>,
       ] : []),
     ]
@@ -865,7 +1179,7 @@ export const register: Register = on => {
   })
 
   on('ui.input', { plugin: 'profile', element: 'api-key' }, async ($, e, next) => {
-    if (e.kind === 'submit') await saveApiKey($, e.value)
+    if (e.kind === 'submit') await saveApiKey($, e.value).catch((err: Error) => $.ui.toast(`The key wasn't saved: ${err.message}`, { timeoutMs: 8000 }))
     return next(e)
   })
 
