@@ -28,7 +28,7 @@ type Script = {
   lines: Line[]
   accounts: Account[]
   toasts: { at: number; text: string }[]
-  ask?: { at: number; pick: number; question: string; yes: string; no: string }
+  ask?: { at: number; pick: number; question: string; options: string[] } // the first option is picked
 }
 
 const GOAL: Script = {
@@ -59,7 +59,7 @@ const GOAL: Script = {
 
 const ASK: Script = {
   tag: 'no goal',
-  caption: 'main runs out → asks first, then carries on',
+  caption: 'main runs out → asks: work, API credit, or stay',
   duration: 300,
   doneAt: 250,
   lines: [
@@ -76,7 +76,7 @@ const ASK: Script = {
     { at: 152, name: 'work', email: 'w@example.com', p: [12, 12, 1], reset: '4h 50m' },
   ],
   toasts: [],
-  ask: { at: 84, pick: 140, question: 'main is out of usage. Switch to work and continue?', yes: '1. Switch to work', no: '2. Stay on main' },
+  ask: { at: 84, pick: 140, question: 'main is out of usage. Continue on work, or on API credit (Console key …WXYZ, billed per token)?', options: ['Switch to work', 'Use API credit', 'Stay on main'] },
 }
 
 const BACK: Script = {
@@ -130,13 +130,14 @@ function Ask({ f, ask }: { f: number; ask: NonNullable<Script['ask']> }) {
   const enter = spring({ frame: f - ask.at, fps, config: { damping: 18 } })
   const isPicked = f >= ask.pick
   return (
-    <div style={{ position: 'absolute', left: 24, right: 24, top: 262, opacity: Math.min(enter, 1 - fade(f, ask.pick + 8, 6)), transform: `translateY(${(1 - enter) * 12}px)` }}>
+    <div style={{ position: 'absolute', left: 24, right: 24, top: 232, opacity: Math.min(enter, 1 - fade(f, ask.pick + 8, 6)), transform: `translateY(${(1 - enter) * 12}px)` }}>
       <div style={{ borderTop: `1px solid ${C.rule}`, paddingTop: 10 }}>
         <span style={{ background: C.cyan, color: C.bg, padding: '1px 8px', borderRadius: 3 }}>Usage</span>
       </div>
-      <div style={{ color: C.strong, fontWeight: 700, marginTop: 8 }}>{ask.question}</div>
-      <div style={{ color: C.cyan, marginTop: 6, fontWeight: isPicked ? 700 : 400, background: isPicked ? '#263238' : 'transparent' }}>{`❯ ${ask.yes}`}</div>
-      <div style={{ color: C.text }}>{`  ${ask.no}`}</div>
+      <div style={{ color: C.strong, fontWeight: 700, marginTop: 8, whiteSpace: 'normal' }}>{ask.question}</div>
+      {ask.options.map((o, i) => i === 0
+        ? <div key={o} style={{ color: C.cyan, marginTop: 6, fontWeight: isPicked ? 700 : 400, background: isPicked ? '#263238' : 'transparent' }}>{`❯ 1. ${o}`}</div>
+        : <div key={o} style={{ color: C.text }}>{`  ${i + 1}. ${o}`}</div>)}
       <div style={{ color: C.subtle, marginTop: 6, fontSize: 13 }}>Enter to select · ↑/↓ to navigate · Esc to cancel</div>
     </div>
   )
