@@ -317,8 +317,8 @@ async function writeStatus($: EngineInterface) {
   await $.fs.write(`${h}/.claude/profile-status.txt`, `${line}\n`)
   // This session's whole status line, which profile-statusline.sh prints.
   const sid = await $.session.id()
-  const top = await Promise.all([$.session.model(), $.session.usage(), $.store.get(`tokens:${sid}`)])
-    .then(([model, use, total]) => sessionLine(model, use.context, total as number | undefined))
+  const top = await Promise.all([$.session.model(), $.session.usage(), $.store.get(`cache:${sid}`)])
+    .then(([model, use, cache]) => sessionLine(model, use.context, cache as Cache | undefined))
     .catch(() => undefined)
   await $.fs.write(`${h}/.claude/profile-statusline/${sid}.txt`, `${top ? `${top}\n` : ''}${line}\n`)
 }
@@ -332,24 +332,35 @@ function modelName(id: string) {
   return m ? `${m[1]![0]!.toUpperCase()}${m[1]!.slice(1)} ${m[2]}${m[3] ? `.${m[3]}` : ''}` : id
 }
 
-/** What ccstatusline drew: model, context used, the session's tokens, and a context bar. */
-function sessionLine(model: string, ctx: { tokens?: number; window: number; percent?: number }, total = 0) {
+/** The session's input tokens, and how many of them were read from the prompt cache. */
+type Cache = { read: number; input: number }
+
+/**
+ * ccstatusline's line: model, context used, the prompt cache's hit rate, and a context bar.
+ * `@EFFORT@` is the effort segment, which profile-statusline.sh fills from Claude Code's input.
+ */
+function sessionLine(model: string, ctx: { tokens?: number; window: number; percent?: number }, cache?: Cache) {
   const used = ctx.tokens ?? 0
   const p = ctx.percent ?? Math.round((used / ctx.window) * 100)
   const fill = Math.round((Math.min(p, 100) / 100) * BAR)
+  const hit = cache?.input ? Math.round((cache.read / cache.input) * 100) : undefined
   return [
-    paint('accent', `Model: ${modelName(model)}`),
+    paint('accent', `Model: ${modelName(model)}`) + '@EFFORT@',
     paint(level(p), `Ctx: ${short(used)}`),
-    paint('accent', `Total: ${short(total)}`),
+    hit !== undefined && paint(level(100 - hit), `Cache: ${hit}%`),
     `${paint(level(p), `Context: ${'█'.repeat(fill)}`)}${paint('subtle', '░'.repeat(BAR - fill))} ${paint(level(p), `${short(used)}/${short(ctx.window)} (${p}%)`)}`,
-  ].join(paint('subtle', ' | '))
+  ].filter(Boolean).join(paint('subtle', ' | '))
 }
 
 // Claude Code's status line runs this: "statusLine": { "type": "command", "command": "sh ~/.claude/profile-statusline.sh" }.
 const STATUSLINE = `#!/bin/sh
 # Written by the profile plugin: prints the status line it keeps for this session.
-id=$(tr -d '\\n' | sed -n 's/.*"session_id"[[:space:]]*:[[:space:]]*"\\([^"]*\\)".*/\\1/p')
-cat "$HOME/.claude/profile-statusline/$id.txt" 2>/dev/null || cat "$HOME/.claude/profile-status.txt" 2>/dev/null
+in=$(tr -d '\\n')
+field() { printf '%s' "$in" | sed -n "s/.*\\"$1\\"[[:space:]]*:[[:space:]]*$2.*/\\1/p"; }
+id=$(field session_id '"\\([^"]*\\)"')
+effort=$(field effort '{[[:space:]]*"level"[[:space:]]*:[[:space:]]*"\\([a-z0-9]*\\)"')
+[ -n "$effort" ] && effort=$(printf '\\033[90m | \\033[0m\\033[35mEffort: %s\\033[0m' "$effort")
+sed "s/@EFFORT@/$effort/" "$HOME/.claude/profile-statusline/$id.txt" 2>/dev/null || cat "$HOME/.claude/profile-status.txt" 2>/dev/null
 `
 
 /** How long until a window resets: `45m`, `2h 5m`, `3d 4h`. */
@@ -478,13 +489,16 @@ export const register: Register = on => {
     return r
   })
 
-  // The session's running token count, for the status line's Total.
+  // The session's prompt-cache hit rate, for the status line.
   on('turn.complete', async ($, e, next) => {
     if (e.usage) {
-      const key = `tokens:${await $.session.id()}`
+      const key = `cache:${await $.session.id()}`
       const u = e.usage
-      const turn = u.input_tokens + u.output_tokens + u.cache_read_input_tokens + u.cache_creation_input_tokens
-      await $.store.set(key, (((await $.store.get(key)) as number | undefined) ?? 0) + turn)
+      const was = ((await $.store.get(key)) as Cache | undefined) ?? { read: 0, input: 0 }
+      await $.store.set(key, {
+        read: was.read + u.cache_read_input_tokens,
+        input: was.input + u.input_tokens + u.cache_read_input_tokens + u.cache_creation_input_tokens,
+      })
     }
     return next(e)
   })

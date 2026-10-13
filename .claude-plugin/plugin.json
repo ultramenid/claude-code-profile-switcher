@@ -1,6 +1,6 @@
 {
   "name": "profile",
-  "version": "0.2.7",
+  "version": "0.2.8",
   "description": "Switch Claude Code's login between accounts: /profile add <name> saves a full login, /profile <name> makes it the live one.",
   "author": {
     "name": "ultramenid",

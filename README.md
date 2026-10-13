@@ -30,10 +30,10 @@ A row above the prompt shows the account, its email and its plan usage, with a b
 
 ### Status line
 
-The plugin can be your whole status line, in the style of ccstatusline: model, context used, the session's tokens and a context bar, with the account row under it.
+The plugin can be your whole status line, in the style of ccstatusline: model and effort, context used, the prompt cache's hit rate and a context bar, with the account row under it.
 
 ```
-Model: Opus 5.5 | Ctx: 216.3k | Total: 104.4M | Context: ██░░░░░░░░ 216.3k/1.0M (22%)
+Model: Opus 5.5 | Effort: high | Ctx: 216.3k | Cache: 98% | Context: ██░░░░░░░░ 216.3k/1.0M (22%)
 ● work w@example.com   5h ██████░░░░ 62% ↻ 2h 5m
 ```
 
@@ -43,7 +43,9 @@ Add this to `~/.claude/settings.json`:
 "statusLine": { "type": "command", "command": "sh ~/.claude/profile-statusline.sh", "refreshInterval": 10 }
 ```
 
-The plugin writes that script and keeps each session's lines current. The row above the prompt then hides in the terminal; the desktop app has no status line, so it keeps the row. Total counts the tokens of the turns since the plugin was installed in that session.
+The plugin writes that script and keeps each session's lines current. The row above the prompt then hides in the terminal; the desktop app has no status line, so it keeps the row. Cache is the share of the session's input tokens read from the prompt cache, from its first message after the plugin loaded.
+
+The usage windows are the ones Claude Code gets a reading for in its responses. For some accounts that's only the 5-hour window, so no 7-day bar shows.
 
 To add only the account row to a status line of your own, print `~/.claude/profile-status.txt` (in ccstatusline: a Custom Command widget, `cat ~/.claude/profile-status.txt 2>/dev/null || true`, preserve colors on). Your login when you first used the plugin is `main`. Tip: do the browser login in a private window, so it doesn't reuse the claude.ai account you're already signed into.
 

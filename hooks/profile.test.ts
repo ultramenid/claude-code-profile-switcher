@@ -151,7 +151,7 @@ test('the band above the prompt shows the account and its usage', async ($, on) 
   await $.turn.complete({ reason: 'answer', answer: 'ok', durationMs: 1000, isAborted: false, turnId: 't1', usage: { input_tokens: 1000, output_tokens: 500, cache_read_input_tokens: 98_500, cache_creation_input_tokens: 0, model: 'claude-opus-5-5' } } as any)
   await measure()
   expect(plain('/home/u/.claude/profile-statusline/sess-1.txt')).toBe(
-    'Model: Opus 5.5 | Ctx: 216.3k | Total: 100.0k | Context: ██░░░░░░░░ 216.3k/1.0M (22%)\n● main me@x   5h ██████░░░░ 62% ↻ 2h 5m\n')
+    'Model: Opus 5.5@EFFORT@ | Ctx: 216.3k | Cache: 99% | Context: ██░░░░░░░░ 216.3k/1.0M (22%)\n● main me@x   5h ██████░░░░ 62% ↻ 2h 5m\n')
   expect(files['/home/u/.claude/profile-statusline.sh']).toContain('profile-statusline/$id.txt')
   for (const surface of ['terminal', 'desktop'] as const) {
     const ui = await $.ui.mount({
