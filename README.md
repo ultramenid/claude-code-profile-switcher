@@ -28,6 +28,17 @@ Works in the terminal and in the Code tab of the Claude desktop app: both run Cl
 
 Your login when you first use the plugin is saved as `main`. Tip: do the browser login for `/profile add` in a private window, so it doesn't reuse the claude.ai account you're already signed into.
 
+## When an account runs out
+
+![main runs out: during a /goal the plugin switches to work by itself and the goal goes on; without one it asks first](docs/fallback.gif)
+
+When a request is refused because the account's plan is used up (its 5-hour or 7-day window at 100%), the plugin switches to the next signed-in account with usage left and sends the same request again, so the turn carries on instead of ending:
+
+- **While a `/goal` runs**, it switches by itself and says so in a notice: the goal keeps going instead of pausing.
+- **Otherwise it asks first**: `main is out of usage. Switch to work and continue?` Say no, or dismiss it, and the turn ends as it would have.
+
+Accounts are tried in `/profile list` order. It skips one whose last reading has a used-up window that hasn't reset yet, and one whose saved login has expired because no window used it for hours (a notice names it: `/profile` to it and reopen Claude Code to renew it). The switch is a `/profile <name>`, with the same effects on other windows.
+
 ## What you see
 
 **In the terminal**, the plugin is your status line, in the style of ccstatusline:
@@ -80,5 +91,6 @@ The status line is a small script, `~/.claude/profile-statusline.sh`, that print
 - **One login for all sessions:** every Claude Code window on this computer shares the live login. A switch moves new windows too, and an open window still on the old account may write its refreshed token back over the switch: reopen open windows after switching.
 - **Remote Control:** Claude Code disconnects it whenever the signed-in account changes and shows a notice. The plugin runs `/remote-control` to reconnect it under the new account, in every open window, whichever one did the switch (each window checks every 5 seconds), where that window had Remote Control: you ran `/remote-control` there, the Claude mobile app is attached, or, in the terminal, `remoteControlAtStartup` is on. The desktop app's and VS Code's own auto-connect toggles can't be read by a plugin, so after a switch run `/remote-control` there yourself once.
 - **Windows is untested:** macOS is tested in daily use and Linux by the test suite; Windows follows the same file layout as Linux but hasn't been run yet, and the status line isn't set up there automatically. Reports welcome.
+- **A goal that ends by itself:** a plugin can't see a goal being met or judged impossible, so until `/goal clear` or `/clear` a used-up plan still switches without asking.
 - `CLAUDE_CONFIG_DIR` isn't supported: the plugin swaps the default login only.
 - If something goes wrong, `/login` always gets you a working login again.

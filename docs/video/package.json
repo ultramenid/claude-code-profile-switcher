@@ -1,0 +1,13 @@
+{
+  "private": true,
+  "scripts": {
+    "studio": "remotion studio src/index.tsx",
+    "render": "remotion render src/index.tsx Fallback ../fallback.gif --codec=gif --every-nth-frame=2"
+  },
+  "dependencies": {
+    "@remotion/cli": "4.0.535",
+    "react": "19.3.0",
+    "react-dom": "19.3.0",
+    "remotion": "4.0.535"
+  }
+}
