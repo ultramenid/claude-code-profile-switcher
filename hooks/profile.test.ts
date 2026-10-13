@@ -133,6 +133,16 @@ test('plan usage from each response is kept per account', async ($, on) => {
   expect(usage.text).toContain('5h  █░░░░░░░░░░░░░░░░░░░ 5%')
 })
 
+test('a weekly bar shows only on an account with a weekly limit', async ($, on) => {
+  const { files } = stage(on)
+  await $.session.start({ source: 'startup', cwd: '/p' } as any)
+  const row = () => files['/home/u/.claude/profile-status.txt']!.replace(/\x1b\[\d+m/g, '')
+  await $.session.measure({ context: {} as any, rateLimits: [{ kind: 'five_hour', percentUsed: 5 }, { kind: 'seven_day', percentUsed: 40 }], changed: ['rateLimits'] })
+  expect(row()).toBe('● main me@x   5h █░░░░░░░░░ 5%   7d ████░░░░░░ 40%\n')
+  await $.session.measure({ context: {} as any, rateLimits: [{ kind: 'five_hour', percentUsed: 6 }], changed: ['rateLimits'] })
+  expect(row()).toBe('● main me@x   5h █░░░░░░░░░ 6%\n')
+})
+
 test('the band above the prompt shows the account and its usage', async ($, on) => {
   const { clock, files } = stage(on)
   on('ui.render', { component: 'AbovePrompt' }, () => ({ type: 'Text', props: {}, children: ['engine'] })) // Claude Code's own band

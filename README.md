@@ -45,7 +45,7 @@ Add this to `~/.claude/settings.json`:
 
 The plugin writes that script and keeps each session's lines current. The row above the prompt then hides in the terminal; the desktop app has no status line, so it keeps the row. Cache is the share of the session's input tokens read from the prompt cache, from its first message after the plugin loaded.
 
-The usage windows are the ones Claude Code gets a reading for in its responses. For some accounts that's only the 5-hour window, so no 7-day bar shows.
+The usage bars come from each response, so they update together: the 5-hour window always, and the 7-day window only on an account that has a weekly limit (on one without, it doesn't show).
 
 To add only the account row to a status line of your own, print `~/.claude/profile-status.txt` (in ccstatusline: a Custom Command widget, `cat ~/.claude/profile-status.txt 2>/dev/null || true`, preserve colors on). Your login when you first used the plugin is `main`. Tip: do the browser login in a private window, so it doesn't reuse the claude.ai account you're already signed into.
 
