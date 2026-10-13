@@ -18,7 +18,7 @@ function stage(on: any, answers: string[] = []) {
   const env: Record<string, string | undefined> = { HOME: '/home/u', USER: 'me' }
   const argvs: string[] = []
   const remote: string[] = []
-  const clip = { text: '' }
+  const panes = new Set<string>()
   on('command.run', { command: 'remote-control' }, () => (remote.push('run'), { text: '' }))
   const surfaces = ['terminal']
   on('session.surfaces', () => ({ value: surfaces }))
@@ -37,6 +37,8 @@ function stage(on: any, answers: string[] = []) {
     const isKey = !env.ANTHROPIC_AUTH_TOKEN && !!env.ANTHROPIC_API_KEY && approved.includes(env.ANTHROPIC_API_KEY.slice(-20))
     return { value: { handle: 'h', kind: isKey ? 'api-key' : 'bearer' } }
   })
+  on('ui.open', (_$: any, e: any) => (panes.add(e.id), { value: { isPlaced: true } }))
+  on('ui.close', (_$: any, e: any) => (panes.delete(e.id), { value: undefined }))
   on('session.start', (_$: any, e: any) => ({ cwd: e.cwd }))
   on('command.register', () => ({ value: { name: 'profile' } }))
   on('session.measure', (_$: any, e: any) => ({ changed: e.changed }))
@@ -48,7 +50,6 @@ function stage(on: any, answers: string[] = []) {
     argvs.push(a.join(' '))
     const out = (stdout: string, exitCode = 0) => ({ value: { exitCode, stdout, stderr: '', isStdoutTruncated: false, isStderrTruncated: false } })
     if (a[0] === 'uname') return out('Darwin\n')
-    if (a[0] === 'pbpaste') return out(clip.text)
     if (a[0] === 'sh' && a[2]!.includes('dump-keychain'))
       return out(Object.keys(keychain).filter(k => k.startsWith('cc-swap-login|')).map(k => `    "acct"<blob>="${k.split('|')[1]}"`).join('\n'))
     if (a[0] !== 'security') return out('')
@@ -75,7 +76,7 @@ function stage(on: any, answers: string[] = []) {
     files['/home/u/.claude.json'] = JSON.stringify({ ...JSON.parse(files['/home/u/.claude.json']!), oauthAccount: { emailAddress: email } })
   }
   const liveEmail = () => JSON.parse(files['/home/u/.claude.json']!).oauthAccount.emailAddress
-  return { keychain, env, argvs, signIn, liveEmail, clock, files, remote, surfaces, rateLimits, clip }
+  return { keychain, env, argvs, signIn, liveEmail, clock, files, remote, surfaces, rateLimits, panes }
 }
 
 test('add captures a full login and puts the current one back; switching swaps the live login', async ($, on) => {
@@ -188,13 +189,17 @@ test('a request refused for a used-up plan goes again on another account: asked 
   expect(toasts.at(-1)).toContain('work: saved login expired')
 })
 
-test('API credit comes after every account: set up from the clipboard, asked or by itself during a /goal, back once a plan resets', async ($, on) => {
-  const { env, signIn, clock, rateLimits, clip, files } = stage(on, ['Switch to work', 'Use API credit'])
+test('API credit comes after every account: pasted in a box, offered when asked, by itself during a /goal, back once a plan resets', async ($, on) => {
+  const { env, signIn, clock, rateLimits, panes, files } = stage(on, ['Use API credit', 'Switch to work', 'Use API credit'])
   const KEY = 'sk-ant-api03-test-0123456789abcdefghijWXYZ'
   const sent: string[] = []
   const toasts: string[] = []
   on('ui.toast', (_$: any, e: any) => (toasts.push(e.text), { value: undefined }))
   on('command.run', { command: 'goal' }, () => ({ text: '' }))
+  on('tool.call', { tool: 'Bash' }, () => { // `env`, as Bash would print it
+    const out = `ANTHROPIC_API_KEY=${env.ANTHROPIC_API_KEY}\nHOME=/home/u\n`
+    return { result: { stdout: out, stderr: '', interrupted: false }, text: out, ref: 1 }
+  })
   on('turn.step', async function* (_$: any, e: any) { // every plan is used up for an hour; the Console key has credit
     const onKey = !env.ANTHROPIC_AUTH_TOKEN && env.ANTHROPIC_API_KEY === KEY
     sent.push(onKey ? 'key' : env.ANTHROPIC_AUTH_TOKEN ?? 'main')
@@ -213,10 +218,27 @@ test('API credit comes after every account: set up from the clipboard, asked or 
   signIn('t-work', 'w@x')
   await clock.advance(3000)
 
-  expect(await run($, 'add api')).toContain('Copy your Console API key') // nothing on the clipboard yet
-  clip.text = KEY
-  expect(await run($, 'add api')).toBe('✓ api saved: Console API key …WXYZ\nBilled only once every account is out of usage · /profile api to switch to it now')
+  expect(await run($, 'add api')).toContain('Paste your Console API key')
+  expect(panes.has('profile-api-key')).toBe(true)
+  await $.ui.mount({ plugin: 'profile', surface: 'terminal', component: 'Pane', requestId: 'profile-api-key',
+    props: { title: 'Console API key', isFocused: true, bodyColumns: 80, placement: 'inline', scroll: { offset: 0, bodyRows: 2 }, view: {} } } as any)
+  await $.ui.input({ plugin: 'profile', key: 'api-key', text: 'hello' })
+  expect(toasts.at(-1)).toContain('No Console API key')
+  await $.ui.input({ plugin: 'profile', key: 'api-key', text: ` ANTHROPIC_API_KEY="${KEY}"\n` }) // the key out of a copied line
+  expect(toasts.at(-1)).toBe('✓ api saved: Console API key …WXYZ · billed only once every account is out of usage')
+  expect(panes.has('profile-api-key')).toBe(false)
   expect(await run($, 'list')).toContain('○ work  w@x\n○ api   API credit · key …WXYZ')
+
+  expect((await step()).answer).toBe('ok') // work had usage, API credit was chosen over it: it stays
+  expect(sent).toEqual(['main', 'key'])
+  await clock.advance(61_000)
+  expect(env.ANTHROPIC_API_KEY).toBe(KEY)
+  // Bash inherits the key: `env` must not carry it into the transcript.
+  const printed = (await $.tool.call({ tool: 'Bash', command: 'env', description: 'Print the environment' } as any)) as any
+  expect(JSON.stringify(printed)).not.toContain(KEY)
+  expect(printed.result.stdout).toBe('ANTHROPIC_API_KEY=[redacted]\nHOME=/home/u\n')
+  await run($, 'main')
+  sent.length = 0
 
   expect((await step()).answer).toBe('ok') // main, then work, then the key: asked each time
   expect(sent).toEqual(['main', 't-work', 'key'])

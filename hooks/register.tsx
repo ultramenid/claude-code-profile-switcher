@@ -471,9 +471,10 @@ async function use($: EngineInterface, name: string): Promise<string> {
   ].join('\n')
 }
 
-// The `api` profile: a Console API key, read from the clipboard so it never goes
-// through the prompt, and kept like a login. Only this session sends it, so other
-// windows keep the live login and its connectors.
+// The `api` profile: a Console API key, pasted into a pane of the plugin's own so it
+// never goes through the prompt or its history, and kept like a login. Only this
+// session sends it, so other windows keep the live login and its connectors.
+const KEY_PANE = 'profile-api-key'
 
 /** Whether this session bills the `api` profile. */
 const onApi = async ($: EngineInterface) => (await $.store.get(`using:${await $.session.id()}`)) === API
@@ -487,25 +488,18 @@ async function apiKey($: EngineInterface): Promise<string | undefined> {
 
 const apiLabel = async ($: EngineInterface) => `API credit · key …${(await apiKey($))?.slice(-4)}`
 
-async function clipboard($: EngineInterface): Promise<string> {
-  const plat = await platform($)
-  const tries = plat === 'mac' ? [['pbpaste']]
-    : plat === 'win' ? [['powershell', '-NoProfile', '-Command', 'Get-Clipboard']]
-    : [['wl-paste', '-n'], ['xclip', '-selection', 'clipboard', '-o'], ['xsel', '-b']]
-  for (const argv of tries) {
-    const r = await $.process.run(argv).catch(() => undefined)
-    if (r?.exitCode === 0 && r.stdout.trim()) return r.stdout.trim()
-  }
-  return ''
+async function setupApi($: EngineInterface): Promise<string> {
+  await $.ui.open({ id: KEY_PANE, title: 'Console API key', focus: true, closeOnEscape: true, rows: 2 })
+  return 'Paste your Console API key (console.anthropic.com → API keys) in the box above the prompt and press Enter · it goes to the plugin alone, not the prompt or its history'
 }
 
-async function setupApi($: EngineInterface): Promise<string> {
-  const key = await clipboard($)
-  if (!/^sk-ant-\S+$/.test(key)) {
-    return `! Copy your Console API key (sk-ant-…, console.anthropic.com → API keys), then /profile add ${API} again · it's read from the clipboard, so it never goes through the prompt`
-  }
+/** Enter in the paste box: the key out of whatever was pasted (a bare key, quoted, or `ANTHROPIC_API_KEY=…`). */
+async function saveApiKey($: EngineInterface, text: string) {
+  const key = /sk-ant-[\w-]+/.exec(text)?.[0]
+  if (!key) return $.ui.toast('No Console API key (sk-ant-…) in that · paste it again, or Esc to cancel', { timeoutMs: 6000 })
   await writeSlot($, API, JSON.stringify({ apiKey: key }))
-  return [`✓ ${API} saved: Console API key …${key.slice(-4)}`, `Billed only once every account is out of usage · /profile ${API} to switch to it now`].join('\n')
+  await $.ui.close({ id: KEY_PANE })
+  $.ui.toast(`✓ ${API} saved: Console API key …${key.slice(-4)} · billed only once every account is out of usage`, { timeoutMs: 8000 })
 }
 
 /** Claude Code sends an env API key only once approved: its last 20 characters in ~/.claude.json, as its own prompt records them. */
@@ -580,6 +574,12 @@ async function spare($: EngineInterface, now: number, skip?: string): Promise<{ 
   return { expired }
 }
 
+/** This session's credentials as they ride in its environment, which every Bash command inherits. */
+async function secrets($: EngineInterface): Promise<string[]> {
+  const all = [await $.env.get('ANTHROPIC_API_KEY'), await $.env.get('ANTHROPIC_AUTH_TOKEN')]
+  return all.filter((s): s is string => !!s && s.length >= 20)
+}
+
 /** What this session sends, to tell whether another step switched meanwhile. */
 const credential = async ($: EngineInterface) => `${await $.env.get('ANTHROPIC_AUTH_TOKEN')}|${await $.env.get('ANTHROPIC_API_KEY')}`
 
@@ -598,26 +598,32 @@ async function failover($: EngineInterface): Promise<boolean> {
   const from = await current($)
   await $.store.set(`limits:${from}`, rateLimits) // so no fallback picks it till it resets
   const { to, expired } = await spare($, now, from)
-  const key = to ? undefined : await apiKey($)
+  const key = await apiKey($)
   if (!to && !key) {
     $.ui.toast(expired.length
       ? `${from} is out of usage · ${expired.join(', ')}: saved login expired, /profile to it and reopen Claude Code to renew it`
       : `${from} is out of usage, and so is every other account`, { timeoutMs: 8000 })
     return false
   }
+  // A goal takes the next account, API credit only after the last; asked, either is offered.
+  let choice = to ?? API
   const isGoal = await $.store.get(`goal:${await $.session.id()}`)
   if (!isGoal) {
-    const yes = to ? `Switch to ${to}` : 'Use API credit'
-    const question = to
-      ? `${from} is out of usage. Switch to ${to} and continue?`
-      : `${from} and every other account are out of usage. Continue on API credit (Console key …${key?.slice(-4)}, billed per token)?`
-    const answer = await $.ui.ask(question, { header: 'Usage', options: [yes, `Stay on ${from}`] }).catch(() => undefined)
-    if (answer !== yes) return false
+    const credit = `Console key …${key?.slice(-4)}, billed per token`
+    const question = !to ? `${from} and every other account are out of usage. Continue on API credit (${credit})?`
+      : key ? `${from} is out of usage. Continue on ${to}, or on API credit (${credit})?`
+      : `${from} is out of usage. Switch to ${to} and continue?`
+    const options = [...(to ? [`Switch to ${to}`] : []), ...(key ? ['Use API credit'] : []), `Stay on ${from}`]
+    const answer = await $.ui.ask(question, { header: 'Usage', options }).catch(() => undefined)
+    if (answer === 'Use API credit') choice = API
+    else if (answer !== `Switch to ${to}`) return false
   }
-  if (to) await use($, to)
-  else if (!(await useApi($, true)).startsWith('✓')) return false
+  // Chosen over an account with usage left, API credit stays till /profile <name>.
+  if (choice === API) {
+    if (!(await useApi($, !to)).startsWith('✓')) return false
+  } else await use($, choice)
   if (isGoal) {
-    $.ui.toast(to ? `${from} is out of usage · switched to ${to} to keep the goal going` : 'Every account is out of usage · on API credit to keep the goal going', { timeoutMs: 8000 })
+    $.ui.toast(choice !== API ? `${from} is out of usage · switched to ${choice} to keep the goal going` : 'Every account is out of usage · on API credit to keep the goal going', { timeoutMs: 8000 })
   }
   return true
 }
@@ -714,6 +720,20 @@ export const register: Register = on => {
     }
   })
 
+  // A command that prints the environment (`env`) would put this session's key or
+  // token in the transcript: blank them out of what any tool hands back, before the
+  // model or the transcript sees it. The command itself is left alone, so permission
+  // rules still match it.
+  on('tool.call', async ($, e, next) => {
+    const r = await next(e)
+    const hidden = await secrets($)
+    const raw = `${r.text ?? ''}${JSON.stringify(r.result ?? '')}`
+    if (!hidden.some(s => raw.includes(s))) return r
+    const blank = (t: string) => hidden.reduce((out, s) => out.split(s).join('[redacted]'), t)
+    if (r.isError) return { deny: blank(r.text ?? '') }
+    return { result: JSON.parse(blank(JSON.stringify(r.result))), context: r.context }
+  })
+
   // ponytail: a goal that ends by itself (met, impossible) is invisible to a plugin, so it
   // counts till /goal clear or /clear; read the transcript's goal entries if that bites.
   on('command.run', { command: 'goal' }, async ($, e, next) => {
@@ -796,6 +816,22 @@ export const register: Register = on => {
         ) : null}
       </Box>
     )
+  })
+
+  // /profile add api's paste box: the key reaches this plugin alone, never the prompt.
+  on('ui.render', { component: 'Pane', requestId: KEY_PANE }, async ($, e) => {
+    const { Box, Input, Text } = $.ui.resolve(e)
+    return (
+      <Box flexDirection="column">
+        <Input key="api-key" label="Console API key " placeholder="sk-ant-…" submitLabel="save" autoFocus onSubmit={() => undefined} />
+        <Text dimColor>Stays out of the prompt and its history · Esc to cancel</Text>
+      </Box>
+    )
+  })
+
+  on('ui.input', { plugin: 'profile', element: 'api-key' }, async ($, e, next) => {
+    if (e.kind === 'submit') await saveApiKey($, e.value)
+    return next(e)
   })
 
   on('ui.render', { component: 'CommandOutput', props: { command: 'profile' } }, async ($, e, next) => {
