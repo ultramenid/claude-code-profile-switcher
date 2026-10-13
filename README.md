@@ -8,6 +8,8 @@ Switch Claude Code's login between accounts with `/profile`. Each account is a f
 /plugin install profile --marketplace ultramenid/claude-code-profile-switcher
 ```
 
+Works in the terminal and in the Code tab of the Claude desktop app: both run Claude Code with the same plugins and the same login, so a switch in one applies to the other.
+
 > [!WARNING]
 > **Switch only with `/profile`.** Claude Code refreshes the live login every few hours, and the old refresh key stops working. The plugin saves the latest version when you switch away with `/profile`. If the login changes another way (you run `/login`, or another open Claude Code window writes its old login back), that account's saved copy may stop working, and switching to it leaves you logged out.
 >
