@@ -9,9 +9,12 @@ import type { EngineInterface, Register } from 'claude-code'
 // next `claude` starts fully on it: plan usage, email, connectors.
 // This session loaded its login at start, so it also gets the target's access
 // token as ANTHROPIC_AUTH_TOKEN until it ends.
+// The `api` profile is a Console API key, billed per token: this session alone
+// sends it, as ANTHROPIC_API_KEY, after every account is out of usage.
 const LIVE = 'Claude Code-credentials'
 const SLOT = 'cc-swap-login'
 const NAME = /^[\w.-]+$/
+const API = 'api'
 const ADD = 'Add account…'
 const FOOTER = '/profile <name> switch · /profile add <name> · /profile remove <name>'
 
@@ -61,7 +64,8 @@ async function names($: EngineInterface): Promise<string[]> {
     const entries = await $.fs.list(await slotDir($)).catch(() => [])
     saved = entries.filter(f => f.kind === 'file' && f.name.endsWith('.json')).map(f => f.name.slice(0, -5))
   }
-  return [...new Set([...saved, ...pending])].sort((a, b) => (a === 'main' ? -1 : b === 'main' ? 1 : a.localeCompare(b)))
+  const rank = (n: string) => (n === 'main' ? 0 : n === API ? 2 : 1) // API credit last: the fallback after the rest
+  return [...new Set([...saved, ...pending])].sort((a, b) => rank(a) - rank(b) || a.localeCompare(b))
 }
 
 const sameAccount = (a?: Login['oauthAccount'], b?: Login['oauthAccount']) =>
@@ -234,6 +238,7 @@ async function watchLogin($: EngineInterface) {
     $.ui.invalidate('ui.render') // the reset countdowns
     void writeStatus($).catch(() => undefined)
     void syncToken($).catch(() => undefined)
+    void backFromApi($).catch(() => undefined)
   })
 }
 
@@ -259,10 +264,12 @@ async function load($: EngineInterface, name: string, login: Login) {
 }
 
 async function rows($: EngineInterface): Promise<Row[]> {
-  const cur = await current($)
+  const live = await current($)
+  const cur = await active($)
   const all = await names($)
-  return Promise.all((all.includes(cur) ? all : [cur, ...all]).map(async name => {
-    const login = name === cur ? await liveLogin($) : await slot($, name)
+  return Promise.all((all.includes(live) ? all : [live, ...all]).map(async name => {
+    if (name === API) return { name, email: await apiLabel($), isActive: name === cur, isPending: false }
+    const login = name === live ? await liveLogin($) : await slot($, name)
     return { name, email: login?.oauthAccount?.emailAddress, usage: await usage($, name), isActive: name === cur, isPending: !login }
   }))
 }
@@ -282,9 +289,10 @@ function listText(list: Row[]): string {
 let band: { name: string; email?: string; limits?: Limit[]; cache?: number; isInStatusLine: boolean } | undefined
 
 async function show($: EngineInterface) {
-  const name = await current($)
+  const name = await active($)
   const cache = hitRate((await $.store.get(`cache:${await $.session.id()}`)) as Cache | undefined)
-  band = { name, email: (await liveLogin($))?.oauthAccount?.emailAddress, limits: await limits($, name), cache, isInStatusLine: await statusLinePrints($) }
+  const email = name === API ? await apiLabel($) : (await liveLogin($))?.oauthAccount?.emailAddress
+  band = { name, email, limits: name === API ? undefined : await limits($, name), cache, isInStatusLine: await statusLinePrints($) }
   await writeStatus($)
   $.ui.invalidate('ui.render')
 }
@@ -420,6 +428,7 @@ function watchSignIn($: EngineInterface, name: string, prev: string, prevToken: 
 }
 
 async function add($: EngineInterface, name: string): Promise<string> {
+  if (name === API) return setupApi($)
   if (!NAME.test(name)) return '! Usage: /profile add <name>  (letters, digits, . _ -)'
   if (await slot($, name)) return `! ${name} is already signed in · /profile ${name} to switch, /profile remove ${name} to start over`
   const cur = await current($)
@@ -437,13 +446,18 @@ async function add($: EngineInterface, name: string): Promise<string> {
 }
 
 async function use($: EngineInterface, name: string): Promise<string> {
+  if (name === API) return useApi($, false)
+  const wasApi = await onApi($)
   const cur = await current($)
-  if (name === cur) return `✓ Already on ${name}`
-  const login = await slot($, name)
+  if (name === cur && !wasApi) return `✓ Already on ${name}`
+  const login = name === cur ? await liveLogin($) : await slot($, name)
   if (!login) return `! ${name} isn't signed in · /profile add ${name}`
-  await save($, cur)
-  await load($, name, login)
-  await reconnectRemote($)
+  if (wasApi) await leaveApi($)
+  if (name !== cur) {
+    await save($, cur)
+    await load($, name, login)
+    await reconnectRemote($)
+  }
   // Back on the login this session started with: drop the token so usage and email return.
   const startedOn = (await $.store.get(`startedOn:${await $.session.id()}`)) as string | undefined
   await $.env.set('ANTHROPIC_AUTH_TOKEN', name === startedOn ? undefined : accessToken(login.creds))
@@ -457,31 +471,135 @@ async function use($: EngineInterface, name: string): Promise<string> {
   ].join('\n')
 }
 
+// The `api` profile: a Console API key, read from the clipboard so it never goes
+// through the prompt, and kept like a login. Only this session sends it, so other
+// windows keep the live login and its connectors.
+
+/** Whether this session bills the `api` profile. */
+const onApi = async ($: EngineInterface) => (await $.store.get(`using:${await $.session.id()}`)) === API
+
+/** Where this session's requests go: `api`, or the live login's account. */
+const active = async ($: EngineInterface) => ((await onApi($)) ? API : current($))
+
+async function apiKey($: EngineInterface): Promise<string | undefined> {
+  return JSON.parse((await readSlot($, API)) ?? '{}').apiKey
+}
+
+const apiLabel = async ($: EngineInterface) => `API credit · key …${(await apiKey($))?.slice(-4)}`
+
+async function clipboard($: EngineInterface): Promise<string> {
+  const plat = await platform($)
+  const tries = plat === 'mac' ? [['pbpaste']]
+    : plat === 'win' ? [['powershell', '-NoProfile', '-Command', 'Get-Clipboard']]
+    : [['wl-paste', '-n'], ['xclip', '-selection', 'clipboard', '-o'], ['xsel', '-b']]
+  for (const argv of tries) {
+    const r = await $.process.run(argv).catch(() => undefined)
+    if (r?.exitCode === 0 && r.stdout.trim()) return r.stdout.trim()
+  }
+  return ''
+}
+
+async function setupApi($: EngineInterface): Promise<string> {
+  const key = await clipboard($)
+  if (!/^sk-ant-\S+$/.test(key)) {
+    return `! Copy your Console API key (sk-ant-…, console.anthropic.com → API keys), then /profile add ${API} again · it's read from the clipboard, so it never goes through the prompt`
+  }
+  await writeSlot($, API, JSON.stringify({ apiKey: key }))
+  return [`✓ ${API} saved: Console API key …${key.slice(-4)}`, `Billed only once every account is out of usage · /profile ${API} to switch to it now`].join('\n')
+}
+
+/** Claude Code sends an env API key only once approved: its last 20 characters in ~/.claude.json, as its own prompt records them. */
+async function approveKey($: EngineInterface, key: string) {
+  const path = await configPath($)
+  const config = JSON.parse(await $.fs.read(path).catch(() => '{}'))
+  const { approved = [], rejected = [] } = config.customApiKeyResponses ?? {}
+  const tail = key.slice(-20)
+  if (approved.includes(tail)) return
+  const customApiKeyResponses = { approved: [...approved, tail], rejected: rejected.filter((r: string) => r !== tail) }
+  await $.fs.write(path, `${JSON.stringify({ ...config, customApiKeyResponses }, null, 2)}\n`)
+}
+
+/** Which credential Claude Code sends with the next request. */
+const sends = ($: EngineInterface) => $.session.authorize().then(a => a?.kind, () => undefined)
+
+/** Bills this session to the `api` profile; `isAuto` when every account ran out, so it comes back by itself. */
+async function useApi($: EngineInterface, isAuto: boolean): Promise<string> {
+  const key = await apiKey($)
+  if (!key) return `! No API credit set up · copy your Console API key, then /profile add ${API}`
+  if (await onApi($)) return `✓ Already on ${API}`
+  const held = await $.env.get('ANTHROPIC_AUTH_TOKEN')
+  await approveKey($, key)
+  await $.env.set('ANTHROPIC_AUTH_TOKEN', undefined) // it outranks ANTHROPIC_API_KEY
+  await $.env.set('ANTHROPIC_API_KEY', key)
+  // Claude Code reads the approval back from ~/.claude.json through a file watcher.
+  for (let i = 0; i < 5 && (await sends($)) !== 'api-key'; i++) await $.clock.sleep(300)
+  if ((await sends($)) !== 'api-key') {
+    await $.env.set('ANTHROPIC_API_KEY', undefined)
+    await $.env.set('ANTHROPIC_AUTH_TOKEN', held)
+    return `! Claude Code didn't take the key …${key.slice(-4)} · still on ${await current($)}`
+  }
+  const sid = await $.session.id()
+  await $.store.set(`using:${sid}`, API)
+  await $.store.set(`apiAuto:${sid}`, isAuto)
+  await show($)
+  return [
+    `✓ Switched to ${API} (${await apiLabel($)})`,
+    `This session bills your Console key from your next message; other windows stay on ${await current($)} · /profile <name> to go back`,
+  ].join('\n')
+}
+
+async function leaveApi($: EngineInterface) {
+  await $.env.set('ANTHROPIC_API_KEY', undefined)
+  await $.store.delete(`apiAuto:${await $.session.id()}`)
+}
+
+/** Back from API credit taken by itself, once an account has usage again. */
+async function backFromApi($: EngineInterface) {
+  if (!(await $.store.get(`apiAuto:${await $.session.id()}`)) || !(await onApi($))) return
+  const { to } = await spare($, await $.clock.now())
+  if (!to) return
+  await use($, to)
+  $.ui.toast(`${to} has usage again · back from API credit`, { timeoutMs: 8000 })
+}
+
 /** A window used up and not reset yet. */
 const isOut = (list: Limit[] | undefined, now: number) =>
   !!list?.some(l => l.percentUsed >= 100 && (!l.resetsAt || Date.parse(l.resetsAt) > now))
 
+/** The first signed-in account, in list order, with usage left and a token this session can use. */
+async function spare($: EngineInterface, now: number, skip?: string): Promise<{ to?: string; expired: string[] }> {
+  const live = await current($)
+  const expired: string[] = []
+  for (const name of await names($)) {
+    if (name === skip || name === API || isOut(await limits($, name), now)) continue
+    const login = name === live ? await liveLogin($) : await slot($, name)
+    // A saved login nothing refreshed for hours holds an expired token: this session can't use it.
+    if (login && expiry(login.creds) <= now) expired.push(name)
+    else if (login) return { to: name, expired }
+  }
+  return { expired }
+}
+
+/** What this session sends, to tell whether another step switched meanwhile. */
+const credential = async ($: EngineInterface) => `${await $.env.get('ANTHROPIC_AUTH_TOKEN')}|${await $.env.get('ANTHROPIC_API_KEY')}`
+
 let failing: Promise<boolean> | undefined // parallel subagents hit the limit together: one switch
 
 /**
- * The live account's plan is used up: switch to a signed-in one whose isn't, by
- * itself while a /goal runs (nobody may be watching), else once the person agrees.
+ * The live account's plan is used up: switch to a signed-in one whose isn't, else to
+ * the `api` profile. By itself while a /goal runs (nobody may be watching), else once
+ * the person agrees.
  */
 async function failover($: EngineInterface): Promise<boolean> {
+  if (await onApi($)) return false // API credit is the last stop
   const now = await $.clock.now()
   const { rateLimits } = await $.session.usage()
   if (!isOut(rateLimits, now)) return false // failed for another reason
   const from = await current($)
   await $.store.set(`limits:${from}`, rateLimits) // so no fallback picks it till it resets
-  // A saved login nothing refreshed for hours holds an expired token: this session can't use it.
-  let to: string | undefined
-  const expired: string[] = []
-  for (const name of await names($)) {
-    const login = name === from || isOut(await limits($, name), now) ? undefined : await slot($, name)
-    if (login && expiry(login.creds) <= now) expired.push(name)
-    else if (login) { to = name; break }
-  }
-  if (!to) {
+  const { to, expired } = await spare($, now, from)
+  const key = to ? undefined : await apiKey($)
+  if (!to && !key) {
     $.ui.toast(expired.length
       ? `${from} is out of usage · ${expired.join(', ')}: saved login expired, /profile to it and reopen Claude Code to renew it`
       : `${from} is out of usage, and so is every other account`, { timeoutMs: 8000 })
@@ -489,18 +607,24 @@ async function failover($: EngineInterface): Promise<boolean> {
   }
   const isGoal = await $.store.get(`goal:${await $.session.id()}`)
   if (!isGoal) {
-    const yes = `Switch to ${to}`
-    const answer = await $.ui.ask(`${from} is out of usage. Switch to ${to} and continue?`, { header: 'Usage', options: [yes, `Stay on ${from}`] }).catch(() => undefined)
+    const yes = to ? `Switch to ${to}` : 'Use API credit'
+    const question = to
+      ? `${from} is out of usage. Switch to ${to} and continue?`
+      : `${from} and every other account are out of usage. Continue on API credit (Console key …${key?.slice(-4)}, billed per token)?`
+    const answer = await $.ui.ask(question, { header: 'Usage', options: [yes, `Stay on ${from}`] }).catch(() => undefined)
     if (answer !== yes) return false
   }
-  await use($, to)
-  if (isGoal) $.ui.toast(`${from} is out of usage · switched to ${to} to keep the goal going`, { timeoutMs: 8000 })
+  if (to) await use($, to)
+  else if (!(await useApi($, true)).startsWith('✓')) return false
+  if (isGoal) {
+    $.ui.toast(to ? `${from} is out of usage · switched to ${to} to keep the goal going` : 'Every account is out of usage · on API credit to keep the goal going', { timeoutMs: 8000 })
+  }
   return true
 }
 
 async function remove($: EngineInterface, name: string): Promise<string> {
   if (!(await names($)).includes(name)) return '! Usage: /profile remove <name>'
-  if ((await current($)) === name) return `! ${name} is the active login · switch away first`
+  if ((await current($)) === name || (await active($)) === name) return `! ${name} is the active login · switch away first`
   await deleteSlot($, name)
   pending.delete(name)
   return `✓ Removed ${name}`
@@ -513,7 +637,7 @@ async function pick($: EngineInterface): Promise<string | undefined> {
   const labels = others.map(r => (r.email ? `${r.name} (${r.email})` : r.name))
   let answer: string
   try {
-    answer = await $.ui.ask(`Switch to which account? (now on ${await current($)})`, { header: 'Account', options: [...labels, ADD] })
+    answer = await $.ui.ask(`Switch to which account? (now on ${await active($)})`, { header: 'Account', options: [...labels, ADD] })
   } catch {
     return undefined // dismissed, or no one to ask (-p)
   }
@@ -532,7 +656,7 @@ export const register: Register = on => {
     await $.command.register({
       name: 'profile',
       description: 'Switch your Claude login between accounts',
-      argumentHint: '[name | add <name> | remove <name> | list]',
+      argumentHint: '[name | add <name> | add api | remove <name> | list]',
     })
     // The login this process loaded; a reload mid-switch (token set) keeps the first answer.
     const key = `startedOn:${await $.session.id()}`
@@ -550,7 +674,7 @@ export const register: Register = on => {
 
   on('session.measure', async ($, e, next) => {
     const r = await next(e)
-    if (e.changed.includes('rateLimits') && e.rateLimits.length) {
+    if (e.changed.includes('rateLimits') && e.rateLimits.length && !(await onApi($))) {
       await $.store.set(`limits:${await current($)}`, e.rateLimits)
       await show($)
     } else await writeStatus($) // context or cost
@@ -579,13 +703,14 @@ export const register: Register = on => {
   })
 
   // A request refused for a used-up plan ends the turn and pauses a /goal: send it
-  // again on another account instead. A changed token means another step already switched.
+  // again on another account, or API credit, instead. A changed credential means
+  // another step already switched.
   on('turn.step', async function* ($, e, next) {
     for (;;) {
-      const held = await $.env.get('ANTHROPIC_AUTH_TOKEN')
+      const held = await credential($)
       const r = yield* next(e)
       if (r.stopReason !== null || next.signal.aborted) return r
-      if (held === (await $.env.get('ANTHROPIC_AUTH_TOKEN')) && !(await (failing ??= failover($).finally(() => (failing = undefined))))) return r
+      if (held === (await credential($)) && !(await (failing ??= failover($).finally(() => (failing = undefined))))) return r
     }
   })
 
@@ -625,6 +750,7 @@ export const register: Register = on => {
   // Account names and verbs after `/profile `.
   on('prompt.submit', async ($, e, next) => {
     await syncToken($).catch(() => undefined)
+    await backFromApi($).catch(() => undefined)
     return next(e)
   })
 

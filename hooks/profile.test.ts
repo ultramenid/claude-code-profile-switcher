@@ -18,6 +18,7 @@ function stage(on: any, answers: string[] = []) {
   const env: Record<string, string | undefined> = { HOME: '/home/u', USER: 'me' }
   const argvs: string[] = []
   const remote: string[] = []
+  const clip = { text: '' }
   on('command.run', { command: 'remote-control' }, () => (remote.push('run'), { text: '' }))
   const surfaces = ['terminal']
   on('session.surfaces', () => ({ value: surfaces }))
@@ -30,6 +31,12 @@ function stage(on: any, answers: string[] = []) {
   on('env.set', (_$: any, e: any) => ((env[e.name] = e.value), { value: undefined }))
   mock.store(on)
   on('session.id', () => ({ value: 'sess-1' }))
+  // Claude Code's order: ANTHROPIC_AUTH_TOKEN, then an approved ANTHROPIC_API_KEY, then the login.
+  on('session.authorize', () => {
+    const approved: string[] = JSON.parse(files['/home/u/.claude.json']!).customApiKeyResponses?.approved ?? []
+    const isKey = !env.ANTHROPIC_AUTH_TOKEN && !!env.ANTHROPIC_API_KEY && approved.includes(env.ANTHROPIC_API_KEY.slice(-20))
+    return { value: { handle: 'h', kind: isKey ? 'api-key' : 'bearer' } }
+  })
   on('session.start', (_$: any, e: any) => ({ cwd: e.cwd }))
   on('command.register', () => ({ value: { name: 'profile' } }))
   on('session.measure', (_$: any, e: any) => ({ changed: e.changed }))
@@ -41,6 +48,7 @@ function stage(on: any, answers: string[] = []) {
     argvs.push(a.join(' '))
     const out = (stdout: string, exitCode = 0) => ({ value: { exitCode, stdout, stderr: '', isStdoutTruncated: false, isStderrTruncated: false } })
     if (a[0] === 'uname') return out('Darwin\n')
+    if (a[0] === 'pbpaste') return out(clip.text)
     if (a[0] === 'sh' && a[2]!.includes('dump-keychain'))
       return out(Object.keys(keychain).filter(k => k.startsWith('cc-swap-login|')).map(k => `    "acct"<blob>="${k.split('|')[1]}"`).join('\n'))
     if (a[0] !== 'security') return out('')
@@ -67,7 +75,7 @@ function stage(on: any, answers: string[] = []) {
     files['/home/u/.claude.json'] = JSON.stringify({ ...JSON.parse(files['/home/u/.claude.json']!), oauthAccount: { emailAddress: email } })
   }
   const liveEmail = () => JSON.parse(files['/home/u/.claude.json']!).oauthAccount.emailAddress
-  return { keychain, env, argvs, signIn, liveEmail, clock, files, remote, surfaces, rateLimits }
+  return { keychain, env, argvs, signIn, liveEmail, clock, files, remote, surfaces, rateLimits, clip }
 }
 
 test('add captures a full login and puts the current one back; switching swaps the live login', async ($, on) => {
@@ -178,6 +186,58 @@ test('a request refused for a used-up plan goes again on another account: asked 
   expect((await step()).stopReason).toBeNull() // nothing refreshed work's saved token: no use switching to it
   expect(env.ANTHROPIC_AUTH_TOKEN).toBeUndefined()
   expect(toasts.at(-1)).toContain('work: saved login expired')
+})
+
+test('API credit comes after every account: set up from the clipboard, asked or by itself during a /goal, back once a plan resets', async ($, on) => {
+  const { env, signIn, clock, rateLimits, clip, files } = stage(on, ['Switch to work', 'Use API credit'])
+  const KEY = 'sk-ant-api03-test-0123456789abcdefghijWXYZ'
+  const sent: string[] = []
+  const toasts: string[] = []
+  on('ui.toast', (_$: any, e: any) => (toasts.push(e.text), { value: undefined }))
+  on('command.run', { command: 'goal' }, () => ({ text: '' }))
+  on('turn.step', async function* (_$: any, e: any) { // every plan is used up for an hour; the Console key has credit
+    const onKey = !env.ANTHROPIC_AUTH_TOKEN && env.ANTHROPIC_API_KEY === KEY
+    sent.push(onKey ? 'key' : env.ANTHROPIC_AUTH_TOKEN ?? 'main')
+    rateLimits.splice(0, 9, ...(onKey ? [] : [{ kind: 'five_hour', percentUsed: 100, resetsAt: new Date(clock.now() + 3_600_000).toISOString() }]))
+    return { turnId: e.turnId, index: e.index, answer: onKey ? 'ok' : '', toolUses: [], stopReason: onKey ? 'end_turn' : null, usage: null }
+  })
+  const step = async () => {
+    const s = $.turn.step({ turnId: 't1', index: 0, model: 'claude-opus-5-5', messageCount: 1 })
+    for (;;) {
+      const r = await s.next()
+      if (r.done) return r.value
+    }
+  }
+  await $.session.start({ source: 'startup', cwd: '/p' } as any)
+  await run($, 'add work')
+  signIn('t-work', 'w@x')
+  await clock.advance(3000)
+
+  expect(await run($, 'add api')).toContain('Copy your Console API key') // nothing on the clipboard yet
+  clip.text = KEY
+  expect(await run($, 'add api')).toBe('✓ api saved: Console API key …WXYZ\nBilled only once every account is out of usage · /profile api to switch to it now')
+  expect(await run($, 'list')).toContain('○ work  w@x\n○ api   API credit · key …WXYZ')
+
+  expect((await step()).answer).toBe('ok') // main, then work, then the key: asked each time
+  expect(sent).toEqual(['main', 't-work', 'key'])
+  expect(env.ANTHROPIC_AUTH_TOKEN).toBeUndefined() // it would outrank the key
+  expect(JSON.parse(files['/home/u/.claude.json']!).customApiKeyResponses.approved).toEqual([KEY.slice(-20)])
+  expect(await run($, 'list')).toContain('● api   API credit · key …WXYZ · active')
+  expect(await run($, 'remove api')).toContain('switch away first')
+
+  await clock.advance(3_660_000) // the plans reset
+  expect(env.ANTHROPIC_API_KEY).toBeUndefined()
+  expect(toasts.at(-1)).toBe('main has usage again · back from API credit')
+
+  sent.length = 0
+  await $.command.run({ command: 'goal', args: 'ship it', origin: { kind: 'composer' }, presentation: { isFullscreen: false, columns: 80 } } as any)
+  expect((await step()).answer).toBe('ok') // a goal runs: no one to ask
+  expect(sent).toEqual(['main', 't-work', 'key'])
+  expect(toasts.at(-1)).toBe('Every account is out of usage · on API credit to keep the goal going')
+
+  expect(await run($, 'work')).toContain('✓ Switched to work (w@x)') // back by hand
+  expect(env.ANTHROPIC_API_KEY).toBeUndefined()
+  expect(env.ANTHROPIC_AUTH_TOKEN).toBe('t-work')
 })
 
 test('the status line is set once, and only where none was', async ($, on) => {
