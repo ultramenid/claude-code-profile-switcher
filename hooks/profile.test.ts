@@ -131,10 +131,18 @@ test('plan usage from each response is kept per account', async ($, on) => {
 })
 
 test('the band above the prompt shows the account and its usage', async ($, on) => {
-  const { clock } = stage(on)
+  const { clock, files } = stage(on)
+  on('ui.render', { component: 'AbovePrompt' }, () => ({ type: 'Text', props: {}, children: ['engine'] })) // Claude Code's own band
   await $.session.start({ source: 'startup', cwd: '/p' } as any)
   const resetsAt = new Date(clock.now() + 125 * 60_000).toISOString()
-  await $.session.measure({ context: {} as any, rateLimits: [{ kind: 'five_hour', percentUsed: 62.4, resetsAt }], changed: ['rateLimits'] } as any)
+  const measure = () => $.session.measure({ context: {} as any, rateLimits: [{ kind: 'five_hour', percentUsed: 62.4, resetsAt }], changed: ['rateLimits'] } as any)
+  await measure()
+  const band = () => $.ui.mount({
+    plugin: 'profile', surface: 'terminal', component: 'AbovePrompt',
+    props: { hasSurvey: false, isWorking: false, maxRows: 10, bodyColumns: 120, scroll: { offset: 0, bodyRows: 10 }, view: {} },
+  })
+  // The same row, coloured, for a status line to print.
+  expect(files['/home/u/.claude/profile-status.txt']!.replace(/\x1b\[\d+m/g, '')).toBe('● main me@x   5h ██████░░░░ 62% ↻ 2h 5m\n')
   for (const surface of ['terminal', 'desktop'] as const) {
     const ui = await $.ui.mount({
       plugin: 'profile', surface, component: 'AbovePrompt',
@@ -146,6 +154,10 @@ test('the band above the prompt shows the account and its usage', async ($, on) 
     expect(await ui.find({ text: '↻ 2h 5m' })).toBeDefined()
     await ui.unmount()
   }
+  // Once the status line prints the file, the row above the prompt steps aside.
+  files['/home/u/.config/ccstatusline/settings.json'] = '{"commandPath": "cat ~/.claude/profile-status.txt"}'
+  await measure()
+  expect((await (await band()).find({ type: 'Text' }))?.text).toBe('engine')
 })
 
 test('reconnects Remote Control after a switch when it is on at startup', async ($, on) => {

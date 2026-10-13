@@ -26,7 +26,9 @@ Works in the terminal and in the Code tab of the Claude desktop app: both run Cl
 | `/profile remove <name>` | Forgets a saved account (not the live one) |
 | `/usage` | On a switched session, the switched account's plan usage (5-hour and 7-day bars with reset times); otherwise Claude Code's own `/usage` |
 
-A row above the prompt shows the account, its email and its plan usage, with a bar per window and the time until it resets: `● work  w@example.com   5h ██████░░░░ 62% ↻ 2h 5m`. Collapse it with `[-]`. Your login when you first used the plugin is `main`. Tip: do the browser login in a private window, so it doesn't reuse the claude.ai account you're already signed into.
+A row above the prompt shows the account, its email and its plan usage, with a bar per window and the time until it resets: `● work  w@example.com   5h ██████░░░░ 62% ↻ 2h 5m`. Collapse it with `[-]`.
+
+To show it in your status line under the prompt instead, print `~/.claude/profile-status.txt` there; the plugin keeps it current, with colours. In a status line script, add `cat ~/.claude/profile-status.txt`. In [ccstatusline](https://github.com/sirmalloc/ccstatusline), add a Custom Command widget with the command `cat ~/.claude/profile-status.txt 2>/dev/null || true` and preserve colors on. Once your status line's command or ccstatusline's config names that file, the row above the prompt hides. Your login when you first used the plugin is `main`. Tip: do the browser login in a private window, so it doesn't reuse the claude.ai account you're already signed into.
 
 ## How it works
 

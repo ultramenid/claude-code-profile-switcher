@@ -220,6 +220,7 @@ async function watchLogin($: EngineInterface) {
   })())
   $.clock.every(60_000, () => {
     $.ui.invalidate('ui.render') // the reset countdowns
+    void writeStatus($).catch(() => undefined)
     void syncToken($).catch(() => undefined)
   })
 }
@@ -264,17 +265,51 @@ function listText(list: Row[]): string {
   return ['Accounts', ...list.map(line), '', FOOTER].join('\n')
 }
 
-// The account and its plan usage, drawn above the prompt by the AbovePrompt hook.
-let band: { name: string; email?: string; limits?: Limit[] } | undefined
+// The account and its plan usage: drawn above the prompt by the AbovePrompt hook, and
+// written to ~/.claude/profile-status.txt for a status line to print in its place.
+let band: { name: string; email?: string; limits?: Limit[]; isInStatusLine: boolean } | undefined
 
 async function show($: EngineInterface) {
   const name = await current($)
-  band = { name, email: (await liveLogin($))?.oauthAccount?.emailAddress, limits: await limits($, name) }
+  band = { name, email: (await liveLogin($))?.oauthAccount?.emailAddress, limits: await limits($, name), isInStatusLine: await statusLinePrints($) }
+  await writeStatus($)
   $.ui.invalidate('ui.render')
+}
+
+/** A status line that prints the file (its command, or ccstatusline's config, names it) shows the row itself. */
+async function statusLinePrints($: EngineInterface) {
+  const h = await home($)
+  const configs = await Promise.all([`${h}/.claude/settings.json`, `${h}/.config/ccstatusline/settings.json`].map(f => $.fs.read(f).catch(() => '')))
+  return configs.some(c => c.includes('profile-status'))
 }
 
 const BAR = 10
 const level = (p: number) => (p >= 80 ? 'error' : p >= 50 ? 'warning' : 'success')
+
+/** One bar per plan window: its label, percent used, cells filled, colour and time to reset. */
+function meters(list: Limit[] | undefined, now: number) {
+  return (list ?? []).map(l => {
+    const p = Math.min(Math.round(l.percentUsed), 100)
+    return { kind: l.kind, label: WINDOWS[l.kind] ?? l.kind, p, fill: Math.round((p / 100) * BAR), color: level(p), reset: until(l.resetsAt, now) }
+  })
+}
+
+const ANSI: Record<string, string> = { success: '32', warning: '33', error: '31', subtle: '90', bold: '1' }
+const paint = (style: string, text: string) => `\x1b[${ANSI[style]}m${text}\x1b[0m`
+
+// ponytail: every open session rewrites the same small file; a status line can rarely catch it mid-write.
+async function writeStatus($: EngineInterface) {
+  if (!band) return
+  const head = [paint('success', '●'), paint('bold', band.name), band.email && paint('subtle', band.email)]
+  const windows = meters(band.limits, await $.clock.now()).map(m => [
+    paint('subtle', m.label),
+    paint(m.color, '█'.repeat(m.fill)) + paint('subtle', '░'.repeat(BAR - m.fill)),
+    paint(m.color, `${m.p}%`),
+    m.reset && paint('subtle', `↻ ${m.reset}`),
+  ])
+  const line = [head, ...windows].map(part => part.filter(Boolean).join(' ')).join('   ')
+  await $.fs.write(`${await home($)}/.claude/profile-status.txt`, `${line}\n`)
+}
 
 /** How long until a window resets: `45m`, `2h 5m`, `3d 4h`. */
 function until(iso: string | undefined, now: number): string | undefined {
@@ -434,25 +469,19 @@ export const register: Register = on => {
   })
 
   on('ui.render', { component: 'AbovePrompt' }, async ($, e, next) => {
-    if (!band || e.props.hasSurvey) return next(e)
+    if (!band || band.isInStatusLine || e.props.hasSurvey) return next(e)
     const { Box, Text } = $.ui.resolve(e)
-    const now = await $.clock.now()
-    const windows = (band.limits ?? []).map(l => {
-      const p = Math.min(Math.round(l.percentUsed), 100)
-      const fill = Math.round((p / 100) * BAR)
-      const reset = until(l.resetsAt, now)
-      return (
-        <Box key={l.kind} gap={1}>
-          <Text color="subtle">{WINDOWS[l.kind] ?? l.kind}</Text>
-          <Box>
-            <Text color={level(p)}>{'█'.repeat(fill)}</Text>
-            <Text color="subtle">{'░'.repeat(BAR - fill)}</Text>
-          </Box>
-          <Text color={level(p)}>{`${p}%`}</Text>
-          {reset ? <Text color="subtle">{`↻ ${reset}`}</Text> : null}
+    const windows = meters(band.limits, await $.clock.now()).map(m => (
+      <Box key={m.kind} gap={1}>
+        <Text color="subtle">{m.label}</Text>
+        <Box>
+          <Text color={m.color}>{'█'.repeat(m.fill)}</Text>
+          <Text color="subtle">{'░'.repeat(BAR - m.fill)}</Text>
         </Box>
-      )
-    })
+        <Text color={m.color}>{`${m.p}%`}</Text>
+        {m.reset ? <Text color="subtle">{`↻ ${m.reset}`}</Text> : null}
+      </Box>
+    ))
     return (
       <Box gap={3}>
         <Box gap={1}>
