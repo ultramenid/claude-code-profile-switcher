@@ -37,13 +37,13 @@ Model: Opus 5.5 | Effort: high | Ctx: 216.3k | Cache: 98% | Context: ██░�
 ● work w@example.com   5h ██████░░░░ 62% ↻ 2h 5m
 ```
 
-Add this to `~/.claude/settings.json`:
+The plugin sets this up itself the first time it runs, when you have no status line yet; it never replaces one you have, and if you remove it, it stays removed. To use it in place of your own, set this in `~/.claude/settings.json`:
 
 ```json
 "statusLine": { "type": "command", "command": "sh ~/.claude/profile-statusline.sh", "refreshInterval": 10 }
 ```
 
-The plugin writes that script and keeps each session's lines current. The row above the prompt then hides in the terminal; the desktop app has no status line, so it keeps the row. Cache is the share of the session's input tokens read from the prompt cache, from its first message after the plugin loaded.
+The plugin writes that script and keeps each session's lines current; once the plugin is uninstalled, the script prints nothing (remove the `statusLine` entry too). The row above the prompt then hides in the terminal; the desktop app has no status line, so it keeps the row. Cache is the share of the session's input tokens read from the prompt cache, from its first message after the plugin loaded.
 
 The usage bars come from each response, so they update together: the 5-hour window always, and the 7-day window only on an account that has a weekly limit (on one without, it doesn't show).
 

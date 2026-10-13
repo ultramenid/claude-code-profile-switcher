@@ -360,8 +360,23 @@ field() { printf '%s' "$in" | sed -n "s/.*\\"$1\\"[[:space:]]*:[[:space:]]*$2.*/
 id=$(field session_id '"\\([^"]*\\)"')
 effort=$(field effort '{[[:space:]]*"level"[[:space:]]*:[[:space:]]*"\\([a-z0-9]*\\)"')
 [ -n "$effort" ] && effort=$(printf '\\033[90m | \\033[0m\\033[35mEffort: %s\\033[0m' "$effort")
-sed "s/@EFFORT@/$effort/" "$HOME/.claude/profile-statusline/$id.txt" 2>/dev/null || cat "$HOME/.claude/profile-status.txt" 2>/dev/null
+sed "s/@EFFORT@/$effort/" "$HOME/.claude/profile-statusline/$id.txt" 2>/dev/null || true
 `
+
+/**
+ * Makes profile-statusline.sh the status line, once: only where none is set (never over
+ * someone's own), and never again after, so removing it keeps it removed.
+ */
+async function claimStatusLine($: EngineInterface) {
+  if ((await $.store.get('statusLineClaimed')) || (await platform($)) === 'win') return
+  await $.store.set('statusLineClaimed', true)
+  const path = `${await home($)}/.claude/settings.json`
+  const settings = await $.fs.read(path).then(JSON.parse).catch(() => undefined) // unreadable: leave it be
+  if (!settings || settings.statusLine) return
+  settings.statusLine = { type: 'command', command: 'sh ~/.claude/profile-statusline.sh', refreshInterval: 10 }
+  await $.fs.write(path, `${JSON.stringify(settings, null, 2)}\n`)
+  $.ui.toast('Status line set to the profile plugin\'s: remove "statusLine" from ~/.claude/settings.json to undo')
+}
 
 /** How long until a window resets: `45m`, `2h 5m`, `3d 4h`. */
 function until(iso: string | undefined, now: number): string | undefined {
@@ -473,6 +488,7 @@ export const register: Register = on => {
     $.ui.status(undefined) // versions before 0.2.4 pinned a status line instead of the band
     const h = await home($)
     await $.fs.write(`${h}/.claude/profile-statusline.sh`, STATUSLINE)
+    await claimStatusLine($)
     // A file per session: drop the ones nothing has written for a week.
     if ((await platform($)) !== 'win') void $.process.run(['find', `${h}/.claude/profile-statusline`, '-name', '*.txt', '-mtime', '+7', '-delete']).catch(() => undefined)
     await show($)

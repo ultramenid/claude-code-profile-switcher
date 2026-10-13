@@ -133,6 +133,29 @@ test('plan usage from each response is kept per account', async ($, on) => {
   expect(usage.text).toContain('5h  █░░░░░░░░░░░░░░░░░░░ 5%')
 })
 
+test('the status line is set once, and only where none was', async ($, on) => {
+  const { files } = stage(on)
+  on('ui.toast', () => ({ value: undefined }))
+  const path = '/home/u/.claude/settings.json'
+  files[path] = '{"enabledPlugins": {"profile@x": true}}'
+  await $.session.start({ source: 'startup', cwd: '/p' } as any)
+  expect(JSON.parse(files[path]!)).toEqual({
+    enabledPlugins: { 'profile@x': true },
+    statusLine: { type: 'command', command: 'sh ~/.claude/profile-statusline.sh', refreshInterval: 10 },
+  })
+  files[path] = '{}' // the user took it out
+  await $.session.start({ source: 'startup', cwd: '/p' } as any)
+  expect(files[path]).toBe('{}')
+})
+
+test('a status line of the user\'s own is kept', async ($, on) => {
+  const { files } = stage(on)
+  const path = '/home/u/.claude/settings.json'
+  files[path] = '{"statusLine": {"type": "command", "command": "ccstatusline"}}'
+  await $.session.start({ source: 'startup', cwd: '/p' } as any)
+  expect(files[path]).toBe('{"statusLine": {"type": "command", "command": "ccstatusline"}}')
+})
+
 test('a weekly bar shows only on an account with a weekly limit', async ($, on) => {
   const { files } = stage(on)
   await $.session.start({ source: 'startup', cwd: '/p' } as any)
