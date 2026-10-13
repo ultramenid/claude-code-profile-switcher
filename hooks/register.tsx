@@ -193,15 +193,18 @@ async function save($: EngineInterface, name: string) {
 
 /**
  * Claude Code drops Remote Control when the signed-in account changes; reconnect it
- * under the new one when it was in use (on at startup, or a remote client attached).
+ * under the new one when this session had it: /remote-control ran here, a phone is
+ * attached, or (terminal only) remoteControlAtStartup turned it on. The desktop app
+ * and VS Code have their own auto-connect toggles, which a plugin can't read.
  */
 async function reconnectRemote($: EngineInterface) {
   seen = await signedIn($)
   const settings = JSON.parse(await $.fs.read(`${await home($)}/.claude/settings.json`).catch(() => '{}'))
-  const attached = (await $.session.surfaces().catch((): string[] => [])).includes('mobile') // a Remote Control client; the desktop app runs Claude Code locally
+  const surfaces = await $.session.surfaces().catch((): string[] => [])
+  const isOn = surfaces.includes('mobile') || (await $.store.get(`remote:${await $.session.id()}`)) === true
+    || (settings.remoteControlAtStartup && surfaces.includes('terminal'))
   // From a timer, outside the /profile run: a command can't start inside the one running.
-  if (settings.remoteControlAtStartup || attached)
-    $.clock.after(500, () => void $.command.run({ command: 'remote-control', args: '' }).catch(() => undefined))
+  if (isOn) $.clock.after(500, () => void $.command.run({ command: 'remote-control', args: '' }).catch(() => undefined))
 }
 
 /** The live account's id, from ~/.claude.json (cheap enough to poll). */
@@ -276,11 +279,13 @@ async function show($: EngineInterface) {
   $.ui.invalidate('ui.render')
 }
 
-/** A status line that prints the file (its command, or ccstatusline's config, names it) shows the row itself. */
+/** A status line that prints the file (its command names it, or it's ccstatusline and its config does) shows the row itself. */
 async function statusLinePrints($: EngineInterface) {
   const h = await home($)
-  const configs = await Promise.all([`${h}/.claude/settings.json`, `${h}/.config/ccstatusline/settings.json`].map(f => $.fs.read(f).catch(() => '')))
-  return configs.some(c => c.includes('profile-status'))
+  const settings = await $.fs.read(`${h}/.claude/settings.json`).then(JSON.parse).catch(() => ({}))
+  const cmd: string = settings.statusLine?.command ?? ''
+  if (cmd.includes('profile-status')) return true
+  return cmd.includes('ccstatusline') && (await $.fs.read(`${h}/.config/ccstatusline/settings.json`).catch(() => '')).includes('profile-status')
 }
 
 const BAR = 10
@@ -432,6 +437,12 @@ export const register: Register = on => {
     return next(e)
   })
 
+  // Remember that this session uses Remote Control, to reconnect it after a switch.
+  on('command.run', { command: 'remote-control' }, async ($, e, next) => {
+    await $.store.set(`remote:${await $.session.id()}`, true)
+    return next(e)
+  })
+
   on('command.run', { command: 'usage' }, async ($, e, next) => {
     const cur = await current($)
     const startedOn = await $.store.get(`startedOn:${await $.session.id()}`)
@@ -469,7 +480,8 @@ export const register: Register = on => {
   })
 
   on('ui.render', { component: 'AbovePrompt' }, async ($, e, next) => {
-    if (!band || band.isInStatusLine || e.props.hasSurvey) return next(e)
+    // A status line shows only in the terminal; the desktop app keeps the row.
+    if (!band || (band.isInStatusLine && e.surface === 'terminal') || e.props.hasSurvey) return next(e)
     const { Box, Text } = $.ui.resolve(e)
     const windows = meters(band.limits, await $.clock.now()).map(m => (
       <Box key={m.kind} gap={1}>

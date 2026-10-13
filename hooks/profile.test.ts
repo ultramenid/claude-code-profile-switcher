@@ -157,7 +157,15 @@ test('the band above the prompt shows the account and its usage', async ($, on) 
   // Once the status line prints the file, the row above the prompt steps aside.
   files['/home/u/.config/ccstatusline/settings.json'] = '{"commandPath": "cat ~/.claude/profile-status.txt"}'
   await measure()
+  expect(await (await band()).find({ type: 'Text', text: 'main' })).toBeDefined() // ccstatusline isn't the status line
+  files['/home/u/.claude/settings.json'] = '{"statusLine": {"type": "command", "command": "ccstatusline"}}'
+  await measure()
   expect((await (await band()).find({ type: 'Text' }))?.text).toBe('engine')
+  const desktop = await $.ui.mount({
+    plugin: 'profile', surface: 'desktop', component: 'AbovePrompt',
+    props: { hasSurvey: false, isWorking: false, maxRows: 10, bodyColumns: 120, scroll: { offset: 0, bodyRows: 10 }, view: {} },
+  })
+  expect(await desktop.find({ type: 'Text', text: 'main' })).toBeDefined() // no status line there
 })
 
 test('reconnects Remote Control after a switch when it is on at startup', async ($, on) => {
@@ -185,6 +193,23 @@ test('reconnects Remote Control for a phone attached, not for the desktop app', 
   await run($, 'main')
   await clock.advance(500)
   expect(remote.length).toBe(1)
+})
+
+test('in the desktop app, reconnects only a session that turned Remote Control on', async ($, on) => {
+  const { files, remote, signIn, clock, surfaces } = stage(on)
+  files['/home/u/.claude/settings.json'] = '{"remoteControlAtStartup":true}' // the terminal's auto-connect
+  surfaces.splice(0, 1, 'desktop')
+  await run($, 'add work')
+  signIn('t-work', 'w@x')
+  await clock.advance(3500)
+  await run($, 'work')
+  await clock.advance(500)
+  expect(remote.length).toBe(0)
+  await $.command.run({ command: 'remote-control', args: '', origin: { kind: 'composer' }, presentation: { isFullscreen: false, columns: 80 } } as any)
+  expect(remote.length).toBe(1) // the person turned it on
+  await run($, 'main')
+  await clock.advance(500)
+  expect(remote.length).toBe(2)
 })
 
 test('reconnects Remote Control when another window switches the login', async ($, on) => {
