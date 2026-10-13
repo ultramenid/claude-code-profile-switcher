@@ -2,6 +2,8 @@
 
 Switch Claude Code's login between accounts with `/profile`. Each account is a full login: after a switch, `claude` opens on that account with its plan usage, email and claude.ai connectors.
 
+![The status line: model, effort, context, cache hit rate, then the account with its 5-hour and 7-day usage bars](docs/statusline.svg)
+
 ## Install
 
 ```
@@ -26,16 +28,13 @@ Works in the terminal and in the Code tab of the Claude desktop app: both run Cl
 | `/profile remove <name>` | Forgets a saved account (not the live one) |
 | `/usage` | On a switched session, the switched account's plan usage (5-hour and 7-day bars with reset times); otherwise Claude Code's own `/usage` |
 
-A row above the prompt shows the account, its email and its plan usage, with a bar per window (5h, and 7d on an account with a weekly limit) and the time until it resets, then the session's prompt-cache hit rate: `● work  w@example.com   5h ██████░░░░ 62% ↻ 2h 5m   Cache 98%`. Collapse it with `[-]`.
+A row above the prompt shows the account, its email and its plan usage, with a bar per window (5h, and 7d on an account with a weekly limit) and the time until it resets, then the session's prompt-cache hit rate. Collapse it with `[-]`. In the desktop app's Code tab:
+
+![The row above the prompt in the desktop app: account, email, 5h and 7d usage bars with reset times, cache hit rate](docs/band.svg)
 
 ### Status line
 
-The plugin can be your whole status line, in the style of ccstatusline: model and effort, context used, the prompt cache's hit rate and a context bar, with the account row under it.
-
-```
-Model: Opus 5.5 | Effort: high | Ctx: 216.3k | Cache: 98% | Context: ██░░░░░░░░ 216.3k/1.0M (22%)
-● work w@example.com   5h ██████░░░░ 62% ↻ 2h 5m
-```
+The plugin can be your whole status line, in the style of ccstatusline (pictured at the top): model and effort, context used, the prompt cache's hit rate and a context bar, with the account row under it.
 
 The plugin sets this up itself the first time it runs, when you have no status line yet; it never replaces one you have, and if you remove it, it stays removed. To use it in place of your own, set this in `~/.claude/settings.json`:
 
