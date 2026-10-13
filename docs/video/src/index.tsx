@@ -98,7 +98,7 @@ const BACK: Script = {
   toasts: [{ at: 92, text: 'main has usage again · back from API credit' }],
 }
 
-/** The plugin's account row: `● work w@example.com   5h █░░░░░░░░░ 12% ↻ 4h 50m`, or `● api API credit · key …WXYZ`. */
+/** The plugin's account row: `● work w@example.com │ 5h ▰▱▱▱▱▱▱▱▱▱ 12% ↻ 4h 50m`, or `● api API credit · key …WXYZ`. */
 function AccountRow({ a, f }: { a: Account; f: number }) {
   const head = (
     <>
@@ -112,8 +112,8 @@ function AccountRow({ a, f }: { a: Account; f: number }) {
   return (
     <span>
       {head}
-      {'   '}<span style={{ color: C.subtle }}>5h</span> <span style={{ color }}>{'█'.repeat(fill)}</span>
-      <span style={{ color: C.subtle }}>{'░'.repeat(10 - fill)}</span> <span style={{ color }}>{`${Math.round(p)}%`}</span>
+      <span style={{ color: C.subtle }}>{' │ '}</span><span style={{ color: C.subtle }}>5h</span> <span style={{ color }}>{'▰'.repeat(fill)}</span>
+      <span style={{ color: C.subtle }}>{'▱'.repeat(10 - fill)}</span> <span style={{ color }}>{`${Math.round(p)}%`}</span>
       {' '}<span style={{ color: C.subtle }}>{`↻ ${a.reset}`}</span>
     </span>
   )
