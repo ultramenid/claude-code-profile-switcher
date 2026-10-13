@@ -169,6 +169,15 @@ const accessToken = (creds: string | undefined): string | undefined => {
   }
 }
 
+/** When a login's access token expires, in ms; Infinity when it doesn't say. */
+const expiry = (creds: string): number => {
+  try {
+    return JSON.parse(creds).claudeAiOauth?.expiresAt ?? Infinity
+  } catch {
+    return Infinity
+  }
+}
+
 async function configPath($: EngineInterface) {
   return `${await home($)}/.claude.json`
 }
@@ -448,6 +457,47 @@ async function use($: EngineInterface, name: string): Promise<string> {
   ].join('\n')
 }
 
+/** A window used up and not reset yet. */
+const isOut = (list: Limit[] | undefined, now: number) =>
+  !!list?.some(l => l.percentUsed >= 100 && (!l.resetsAt || Date.parse(l.resetsAt) > now))
+
+let failing: Promise<boolean> | undefined // parallel subagents hit the limit together: one switch
+
+/**
+ * The live account's plan is used up: switch to a signed-in one whose isn't, by
+ * itself while a /goal runs (nobody may be watching), else once the person agrees.
+ */
+async function failover($: EngineInterface): Promise<boolean> {
+  const now = await $.clock.now()
+  const { rateLimits } = await $.session.usage()
+  if (!isOut(rateLimits, now)) return false // failed for another reason
+  const from = await current($)
+  await $.store.set(`limits:${from}`, rateLimits) // so no fallback picks it till it resets
+  // A saved login nothing refreshed for hours holds an expired token: this session can't use it.
+  let to: string | undefined
+  const expired: string[] = []
+  for (const name of await names($)) {
+    const login = name === from || isOut(await limits($, name), now) ? undefined : await slot($, name)
+    if (login && expiry(login.creds) <= now) expired.push(name)
+    else if (login) { to = name; break }
+  }
+  if (!to) {
+    $.ui.toast(expired.length
+      ? `${from} is out of usage · ${expired.join(', ')}: saved login expired, /profile to it and reopen Claude Code to renew it`
+      : `${from} is out of usage, and so is every other account`, { timeoutMs: 8000 })
+    return false
+  }
+  const isGoal = await $.store.get(`goal:${await $.session.id()}`)
+  if (!isGoal) {
+    const yes = `Switch to ${to}`
+    const answer = await $.ui.ask(`${from} is out of usage. Switch to ${to} and continue?`, { header: 'Usage', options: [yes, `Stay on ${from}`] }).catch(() => undefined)
+    if (answer !== yes) return false
+  }
+  await use($, to)
+  if (isGoal) $.ui.toast(`${from} is out of usage · switched to ${to} to keep the goal going`, { timeoutMs: 8000 })
+  return true
+}
+
 async function remove($: EngineInterface, name: string): Promise<string> {
   if (!(await names($)).includes(name)) return '! Usage: /profile remove <name>'
   if ((await current($)) === name) return `! ${name} is the active login · switch away first`
@@ -525,6 +575,31 @@ export const register: Register = on => {
   // Remember that this session uses Remote Control, to reconnect it after a switch.
   on('command.run', { command: 'remote-control' }, async ($, e, next) => {
     await $.store.set(`remote:${await $.session.id()}`, true)
+    return next(e)
+  })
+
+  // A request refused for a used-up plan ends the turn and pauses a /goal: send it
+  // again on another account instead. A changed token means another step already switched.
+  on('turn.step', async function* ($, e, next) {
+    for (;;) {
+      const held = await $.env.get('ANTHROPIC_AUTH_TOKEN')
+      const r = yield* next(e)
+      if (r.stopReason !== null || next.signal.aborted) return r
+      if (held === (await $.env.get('ANTHROPIC_AUTH_TOKEN')) && !(await (failing ??= failover($).finally(() => (failing = undefined))))) return r
+    }
+  })
+
+  // ponytail: a goal that ends by itself (met, impossible) is invisible to a plugin, so it
+  // counts till /goal clear or /clear; read the transcript's goal entries if that bites.
+  on('command.run', { command: 'goal' }, async ($, e, next) => {
+    const arg = e.args.trim()
+    const key = `goal:${await $.session.id()}`
+    if (arg) await (/^(clear|stop|off|reset|none|cancel)$/i.test(arg) ? $.store.delete(key) : $.store.set(key, true))
+    return next(e)
+  })
+
+  on('command.run', { command: 'clear' }, async ($, e, next) => {
+    await $.store.delete(`goal:${await $.session.id()}`)
     return next(e)
   })
 

@@ -24,7 +24,8 @@ function stage(on: any, answers: string[] = []) {
   on('ui.status', () => ({ value: undefined }))
   on('session.model', () => ({ value: 'claude-opus-5-5' }))
   on('turn.complete', () => ({ text: '' }))
-  on('session.usage', () => ({ value: { startedAt: 0, context: { tokens: 216_300, window: 1_000_000, percent: 22 }, rateLimits: [] } }))
+  const rateLimits: { kind: string; percentUsed: number }[] = []
+  on('session.usage', () => ({ value: { startedAt: 0, context: { tokens: 216_300, window: 1_000_000, percent: 22 }, rateLimits } }))
   on('env.get', (_$: any, e: any) => ({ value: env[e.name] }))
   on('env.set', (_$: any, e: any) => ((env[e.name] = e.value), { value: undefined }))
   mock.store(on)
@@ -66,7 +67,7 @@ function stage(on: any, answers: string[] = []) {
     files['/home/u/.claude.json'] = JSON.stringify({ ...JSON.parse(files['/home/u/.claude.json']!), oauthAccount: { emailAddress: email } })
   }
   const liveEmail = () => JSON.parse(files['/home/u/.claude.json']!).oauthAccount.emailAddress
-  return { keychain, env, argvs, signIn, liveEmail, clock, files, remote, surfaces }
+  return { keychain, env, argvs, signIn, liveEmail, clock, files, remote, surfaces, rateLimits }
 }
 
 test('add captures a full login and puts the current one back; switching swaps the live login', async ($, on) => {
@@ -131,6 +132,52 @@ test('plan usage from each response is kept per account', async ($, on) => {
   const usage = await $.command.run({ command: 'usage', args: '', origin: { kind: 'plugin', name: 'profile' }, presentation: { isFullscreen: false, columns: 80 } } as any)
   expect(usage.text).toContain('Plan usage · work (w@x)')
   expect(usage.text).toContain('5h  █░░░░░░░░░░░░░░░░░░░ 5%')
+})
+
+test('a request refused for a used-up plan goes again on another account: asked first, by itself during a /goal', async ($, on) => {
+  const { env, signIn, clock, rateLimits, keychain } = stage(on, ['Switch to work'])
+  const sent: (string | undefined)[] = []
+  const toasts: string[] = []
+  on('ui.toast', (_$: any, e: any) => (toasts.push(e.text), { value: undefined }))
+  on('command.run', { command: 'goal' }, () => ({ text: '' }))
+  on('turn.step', async function* (_$: any, e: any) { // the API: main, the login the session started on, is used up
+    sent.push(env.ANTHROPIC_AUTH_TOKEN)
+    const isOut = env.ANTHROPIC_AUTH_TOKEN !== 't-work'
+    rateLimits.splice(0, 9, { kind: 'five_hour', percentUsed: isOut ? 100 : 3 })
+    return { turnId: e.turnId, index: e.index, answer: isOut ? '' : 'ok', toolUses: [], stopReason: isOut ? null : 'end_turn', usage: null }
+  })
+  const step = async () => {
+    const s = $.turn.step({ turnId: 't1', index: 0, model: 'claude-opus-5-5', messageCount: 1 })
+    for (;;) {
+      const r = await s.next()
+      if (r.done) return r.value
+    }
+  }
+  await $.session.start({ source: 'startup', cwd: '/p' } as any)
+  await run($, 'add work')
+  signIn('t-work', 'w@x')
+  await clock.advance(3000)
+
+  expect((await step()).answer).toBe('ok') // asked, and agreed
+  expect(sent).toEqual([undefined, 't-work'])
+  expect(await run($, 'list')).toContain('○ main  me@x · 5h 100%')
+
+  await run($, 'main')
+  sent.length = 0
+  expect((await step()).stopReason).toBeNull() // asked, and dismissed: the turn fails as before
+  expect(sent).toEqual([undefined])
+  expect(env.ANTHROPIC_AUTH_TOKEN).toBeUndefined()
+
+  await $.command.run({ command: 'goal', args: 'all tests pass', origin: { kind: 'composer' }, presentation: { isFullscreen: false, columns: 80 } } as any)
+  expect((await step()).answer).toBe('ok') // a goal runs: no one to ask
+  expect(toasts.at(-1)).toBe('main is out of usage · switched to work to keep the goal going')
+
+  await run($, 'main')
+  const work = JSON.parse(keychain['cc-swap-login|work']!)
+  keychain['cc-swap-login|work'] = JSON.stringify({ ...work, creds: JSON.stringify({ claudeAiOauth: { accessToken: 't-work', expiresAt: 1 } }) })
+  expect((await step()).stopReason).toBeNull() // nothing refreshed work's saved token: no use switching to it
+  expect(env.ANTHROPIC_AUTH_TOKEN).toBeUndefined()
+  expect(toasts.at(-1)).toContain('work: saved login expired')
 })
 
 test('the status line is set once, and only where none was', async ($, on) => {
