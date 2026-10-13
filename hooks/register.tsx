@@ -270,11 +270,12 @@ function listText(list: Row[]): string {
 
 // The account and its plan usage: drawn above the prompt by the AbovePrompt hook, and
 // written to ~/.claude/profile-status.txt for a status line to print in its place.
-let band: { name: string; email?: string; limits?: Limit[]; isInStatusLine: boolean } | undefined
+let band: { name: string; email?: string; limits?: Limit[]; cache?: number; isInStatusLine: boolean } | undefined
 
 async function show($: EngineInterface) {
   const name = await current($)
-  band = { name, email: (await liveLogin($))?.oauthAccount?.emailAddress, limits: await limits($, name), isInStatusLine: await statusLinePrints($) }
+  const cache = hitRate((await $.store.get(`cache:${await $.session.id()}`)) as Cache | undefined)
+  band = { name, email: (await liveLogin($))?.oauthAccount?.emailAddress, limits: await limits($, name), cache, isInStatusLine: await statusLinePrints($) }
   await writeStatus($)
   $.ui.invalidate('ui.render')
 }
@@ -334,6 +335,7 @@ function modelName(id: string) {
 
 /** The session's input tokens, and how many of them were read from the prompt cache. */
 type Cache = { read: number; input: number }
+const hitRate = (c?: Cache) => (c?.input ? Math.round((c.read / c.input) * 100) : undefined)
 
 /**
  * ccstatusline's line: model, context used, the prompt cache's hit rate, and a context bar.
@@ -343,7 +345,7 @@ function sessionLine(model: string, ctx: { tokens?: number; window: number; perc
   const used = ctx.tokens ?? 0
   const p = ctx.percent ?? Math.round((used / ctx.window) * 100)
   const fill = Math.round((Math.min(p, 100) / 100) * BAR)
-  const hit = cache?.input ? Math.round((cache.read / cache.input) * 100) : undefined
+  const hit = hitRate(cache)
   return [
     paint('accent', `Model: ${modelName(model)}`) + '@EFFORT@',
     paint(level(p), `Ctx: ${short(used)}`),
@@ -515,6 +517,7 @@ export const register: Register = on => {
         read: was.read + u.cache_read_input_tokens,
         input: was.input + u.input_tokens + u.cache_read_input_tokens + u.cache_creation_input_tokens,
       })
+      await show($)
     }
     return next(e)
   })
@@ -584,6 +587,12 @@ export const register: Register = on => {
           {band.email && e.props.bodyColumns >= 90 ? <Text color="subtle">{band.email}</Text> : null}
         </Box>
         {windows}
+        {band.cache !== undefined ? (
+          <Box gap={1}>
+            <Text color="subtle">Cache</Text>
+            <Text color={level(100 - band.cache)}>{`${band.cache}%`}</Text>
+          </Box>
+        ) : null}
       </Box>
     )
   })

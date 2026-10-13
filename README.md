@@ -26,7 +26,7 @@ Works in the terminal and in the Code tab of the Claude desktop app: both run Cl
 | `/profile remove <name>` | Forgets a saved account (not the live one) |
 | `/usage` | On a switched session, the switched account's plan usage (5-hour and 7-day bars with reset times); otherwise Claude Code's own `/usage` |
 
-A row above the prompt shows the account, its email and its plan usage, with a bar per window and the time until it resets: `● work  w@example.com   5h ██████░░░░ 62% ↻ 2h 5m`. Collapse it with `[-]`.
+A row above the prompt shows the account, its email and its plan usage, with a bar per window (5h, and 7d on an account with a weekly limit) and the time until it resets, then the session's prompt-cache hit rate: `● work  w@example.com   5h ██████░░░░ 62% ↻ 2h 5m   Cache 98%`. Collapse it with `[-]`.
 
 ### Status line
 

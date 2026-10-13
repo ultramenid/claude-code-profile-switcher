@@ -195,6 +195,7 @@ test('the band above the prompt shows the account and its usage', async ($, on) 
     expect(await ui.find({ text: 'me@x' })).toBeDefined()
     expect((await ui.find({ type: 'Text', text: '62%' }))?.props.color).toBe('warning')
     expect(await ui.find({ text: '↻ 2h 5m' })).toBeDefined()
+    expect((await ui.find({ type: 'Text', text: '99%' }))?.props.color).toBe('success') // the prompt cache's hit rate
     await ui.unmount()
   }
   // Once the status line prints the file, the row above the prompt steps aside.
