@@ -22,6 +22,9 @@ function stage(on: any, answers: string[] = []) {
   const surfaces = ['terminal']
   on('session.surfaces', () => ({ value: surfaces }))
   on('ui.status', () => ({ value: undefined }))
+  on('session.model', () => ({ value: 'claude-opus-5-5' }))
+  on('turn.complete', () => ({ text: '' }))
+  on('session.usage', () => ({ value: { startedAt: 0, context: { tokens: 216_300, window: 1_000_000, percent: 22 }, rateLimits: [] } }))
   on('env.get', (_$: any, e: any) => ({ value: env[e.name] }))
   on('env.set', (_$: any, e: any) => ((env[e.name] = e.value), { value: undefined }))
   mock.store(on)
@@ -142,7 +145,14 @@ test('the band above the prompt shows the account and its usage', async ($, on) 
     props: { hasSurvey: false, isWorking: false, maxRows: 10, bodyColumns: 120, scroll: { offset: 0, bodyRows: 10 }, view: {} },
   })
   // The same row, coloured, for a status line to print.
-  expect(files['/home/u/.claude/profile-status.txt']!.replace(/\x1b\[\d+m/g, '')).toBe('● main me@x   5h ██████░░░░ 62% ↻ 2h 5m\n')
+  const plain = (path: string) => files[path]!.replace(/\x1b\[\d+m/g, '')
+  expect(plain('/home/u/.claude/profile-status.txt')).toBe('● main me@x   5h ██████░░░░ 62% ↻ 2h 5m\n')
+  // And this session's whole status line, ccstatusline's line above it, for profile-statusline.sh.
+  await $.turn.complete({ reason: 'answer', answer: 'ok', durationMs: 1000, isAborted: false, turnId: 't1', usage: { input_tokens: 1000, output_tokens: 500, cache_read_input_tokens: 98_500, cache_creation_input_tokens: 0, model: 'claude-opus-5-5' } } as any)
+  await measure()
+  expect(plain('/home/u/.claude/profile-statusline/sess-1.txt')).toBe(
+    'Model: Opus 5.5 | Ctx: 216.3k | Total: 100.0k | Context: ██░░░░░░░░ 216.3k/1.0M (22%)\n● main me@x   5h ██████░░░░ 62% ↻ 2h 5m\n')
+  expect(files['/home/u/.claude/profile-statusline.sh']).toContain('profile-statusline/$id.txt')
   for (const surface of ['terminal', 'desktop'] as const) {
     const ui = await $.ui.mount({
       plugin: 'profile', surface, component: 'AbovePrompt',

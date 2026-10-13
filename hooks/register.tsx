@@ -299,7 +299,7 @@ function meters(list: Limit[] | undefined, now: number) {
   })
 }
 
-const ANSI: Record<string, string> = { success: '32', warning: '33', error: '31', subtle: '90', bold: '1' }
+const ANSI: Record<string, string> = { success: '32', warning: '33', error: '31', subtle: '90', bold: '1', accent: '36' }
 const paint = (style: string, text: string) => `\x1b[${ANSI[style]}m${text}\x1b[0m`
 
 // ponytail: every open session rewrites the same small file; a status line can rarely catch it mid-write.
@@ -313,8 +313,44 @@ async function writeStatus($: EngineInterface) {
     m.reset && paint('subtle', `↻ ${m.reset}`),
   ])
   const line = [head, ...windows].map(part => part.filter(Boolean).join(' ')).join('   ')
-  await $.fs.write(`${await home($)}/.claude/profile-status.txt`, `${line}\n`)
+  const h = await home($)
+  await $.fs.write(`${h}/.claude/profile-status.txt`, `${line}\n`)
+  // This session's whole status line, which profile-statusline.sh prints.
+  const sid = await $.session.id()
+  const top = await Promise.all([$.session.model(), $.session.usage(), $.store.get(`tokens:${sid}`)])
+    .then(([model, use, total]) => sessionLine(model, use.context, total as number | undefined))
+    .catch(() => undefined)
+  await $.fs.write(`${h}/.claude/profile-statusline/${sid}.txt`, `${top ? `${top}\n` : ''}${line}\n`)
 }
+
+/** `950`, `216.3k`, `1.0M` */
+const short = (n: number) => (n >= 1e6 ? `${(n / 1e6).toFixed(1)}M` : n >= 1e3 ? `${(n / 1e3).toFixed(1)}k` : `${n}`)
+
+/** `claude-opus-5-5` reads `Opus 5.5`; an id of another shape stays as it is. */
+function modelName(id: string) {
+  const m = /^claude-([a-z]+)-(\d+)(?:-(\d{1,2})(?!\d))?/.exec(id)
+  return m ? `${m[1]![0]!.toUpperCase()}${m[1]!.slice(1)} ${m[2]}${m[3] ? `.${m[3]}` : ''}` : id
+}
+
+/** What ccstatusline drew: model, context used, the session's tokens, and a context bar. */
+function sessionLine(model: string, ctx: { tokens?: number; window: number; percent?: number }, total = 0) {
+  const used = ctx.tokens ?? 0
+  const p = ctx.percent ?? Math.round((used / ctx.window) * 100)
+  const fill = Math.round((Math.min(p, 100) / 100) * BAR)
+  return [
+    paint('accent', `Model: ${modelName(model)}`),
+    paint(level(p), `Ctx: ${short(used)}`),
+    paint('accent', `Total: ${short(total)}`),
+    `${paint(level(p), `Context: ${'█'.repeat(fill)}`)}${paint('subtle', '░'.repeat(BAR - fill))} ${paint(level(p), `${short(used)}/${short(ctx.window)} (${p}%)`)}`,
+  ].join(paint('subtle', ' | '))
+}
+
+// Claude Code's status line runs this: "statusLine": { "type": "command", "command": "sh ~/.claude/profile-statusline.sh" }.
+const STATUSLINE = `#!/bin/sh
+# Written by the profile plugin: prints the status line it keeps for this session.
+id=$(tr -d '\\n' | sed -n 's/.*"session_id"[[:space:]]*:[[:space:]]*"\\([^"]*\\)".*/\\1/p')
+cat "$HOME/.claude/profile-statusline/$id.txt" 2>/dev/null || cat "$HOME/.claude/profile-status.txt" 2>/dev/null
+`
 
 /** How long until a window resets: `45m`, `2h 5m`, `3d 4h`. */
 function until(iso: string | undefined, now: number): string | undefined {
@@ -424,15 +460,31 @@ export const register: Register = on => {
     const key = `startedOn:${await $.session.id()}`
     if (!(await $.env.get('ANTHROPIC_AUTH_TOKEN')) && !(await $.store.get(key))) await $.store.set(key, await current($))
     $.ui.status(undefined) // versions before 0.2.4 pinned a status line instead of the band
+    const h = await home($)
+    await $.fs.write(`${h}/.claude/profile-statusline.sh`, STATUSLINE)
+    // A file per session: drop the ones nothing has written for a week.
+    if ((await platform($)) !== 'win') void $.process.run(['find', `${h}/.claude/profile-statusline`, '-name', '*.txt', '-mtime', '+7', '-delete']).catch(() => undefined)
     await show($)
     await watchLogin($)
     return next(e)
   })
 
   on('session.measure', async ($, e, next) => {
+    const r = await next(e)
     if (e.changed.includes('rateLimits') && e.rateLimits.length) {
       await $.store.set(`limits:${await current($)}`, e.rateLimits)
       await show($)
+    } else await writeStatus($) // context or cost
+    return r
+  })
+
+  // The session's running token count, for the status line's Total.
+  on('turn.complete', async ($, e, next) => {
+    if (e.usage) {
+      const key = `tokens:${await $.session.id()}`
+      const u = e.usage
+      const turn = u.input_tokens + u.output_tokens + u.cache_read_input_tokens + u.cache_creation_input_tokens
+      await $.store.set(key, (((await $.store.get(key)) as number | undefined) ?? 0) + turn)
     }
     return next(e)
   })

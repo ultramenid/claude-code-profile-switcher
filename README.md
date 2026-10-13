@@ -28,7 +28,24 @@ Works in the terminal and in the Code tab of the Claude desktop app: both run Cl
 
 A row above the prompt shows the account, its email and its plan usage, with a bar per window and the time until it resets: `● work  w@example.com   5h ██████░░░░ 62% ↻ 2h 5m`. Collapse it with `[-]`.
 
-To show it in your status line under the prompt instead, print `~/.claude/profile-status.txt` there; the plugin keeps it current, with colours. In a status line script, add `cat ~/.claude/profile-status.txt`. In [ccstatusline](https://github.com/sirmalloc/ccstatusline), add a Custom Command widget with the command `cat ~/.claude/profile-status.txt 2>/dev/null || true` and preserve colors on. Once your status line prints that file (its command names it, or it's ccstatusline with that widget), the row above the prompt hides in the terminal. The desktop app has no status line, so it keeps the row. Your login when you first used the plugin is `main`. Tip: do the browser login in a private window, so it doesn't reuse the claude.ai account you're already signed into.
+### Status line
+
+The plugin can be your whole status line, in the style of ccstatusline: model, context used, the session's tokens and a context bar, with the account row under it.
+
+```
+Model: Opus 5.5 | Ctx: 216.3k | Total: 104.4M | Context: ██░░░░░░░░ 216.3k/1.0M (22%)
+● work w@example.com   5h ██████░░░░ 62% ↻ 2h 5m
+```
+
+Add this to `~/.claude/settings.json`:
+
+```json
+"statusLine": { "type": "command", "command": "sh ~/.claude/profile-statusline.sh", "refreshInterval": 10 }
+```
+
+The plugin writes that script and keeps each session's lines current. The row above the prompt then hides in the terminal; the desktop app has no status line, so it keeps the row. Total counts the tokens of the turns since the plugin was installed in that session.
+
+To add only the account row to a status line of your own, print `~/.claude/profile-status.txt` (in ccstatusline: a Custom Command widget, `cat ~/.claude/profile-status.txt 2>/dev/null || true`, preserve colors on). Your login when you first used the plugin is `main`. Tip: do the browser login in a private window, so it doesn't reuse the claude.ai account you're already signed into.
 
 ## How it works
 
