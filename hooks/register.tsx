@@ -198,7 +198,7 @@ async function save($: EngineInterface, name: string) {
 async function reconnectRemote($: EngineInterface) {
   seen = await signedIn($)
   const settings = JSON.parse(await $.fs.read(`${await home($)}/.claude/settings.json`).catch(() => '{}'))
-  const attached = (await $.session.surfaces().catch(() => [])).includes('mobile') // a Remote Control client; the desktop app runs Claude Code locally
+  const attached = (await $.session.surfaces().catch((): string[] => [])).includes('mobile') // a Remote Control client; the desktop app runs Claude Code locally
   // From a timer, outside the /profile run: a command can't start inside the one running.
   if (settings.remoteControlAtStartup || attached)
     $.clock.after(500, () => void $.command.run({ command: 'remote-control', args: '' }).catch(() => undefined))
@@ -218,7 +218,10 @@ async function watchLogin($: EngineInterface) {
     if (pending.size) return // an add briefly swaps the login and puts it back
     if ((await signedIn($)) !== seen) await reconnectRemote($)
   })())
-  $.clock.every(60_000, () => void syncToken($).catch(() => undefined))
+  $.clock.every(60_000, () => {
+    $.ui.invalidate('ui.render') // the reset countdowns
+    void syncToken($).catch(() => undefined)
+  })
 }
 
 /**
@@ -261,10 +264,25 @@ function listText(list: Row[]): string {
   return ['Accounts', ...list.map(line), '', FOOTER].join('\n')
 }
 
+// The account and its plan usage, drawn above the prompt by the AbovePrompt hook.
+let band: { name: string; email?: string; limits?: Limit[] } | undefined
+
 async function show($: EngineInterface) {
-  const cur = await current($)
-  const u = await usage($, cur)
-  $.ui.status(`account: ${cur}${u ? ` · ${u}` : ''}`)
+  const name = await current($)
+  band = { name, email: (await liveLogin($))?.oauthAccount?.emailAddress, limits: await limits($, name) }
+  $.ui.invalidate('ui.render')
+}
+
+const BAR = 10
+const level = (p: number) => (p >= 80 ? 'error' : p >= 50 ? 'warning' : 'success')
+
+/** How long until a window resets: `45m`, `2h 5m`, `3d 4h`. */
+function until(iso: string | undefined, now: number): string | undefined {
+  if (!iso) return undefined
+  const m = Math.max(0, Math.round((Date.parse(iso) - now) / 60_000))
+  const d = Math.floor(m / 1440)
+  const h = Math.floor((m % 1440) / 60)
+  return d ? `${d}d ${h}h` : h ? `${h}h ${m % 60}m` : `${m}m`
 }
 
 /**
@@ -365,6 +383,7 @@ export const register: Register = on => {
     // The login this process loaded; a reload mid-switch (token set) keeps the first answer.
     const key = `startedOn:${await $.session.id()}`
     if (!(await $.env.get('ANTHROPIC_AUTH_TOKEN')) && !(await $.store.get(key))) await $.store.set(key, await current($))
+    $.ui.status(undefined) // versions before 0.2.4 pinned a status line instead of the band
     await show($)
     await watchLogin($)
     return next(e)
@@ -412,6 +431,38 @@ export const register: Register = on => {
       ...verbs.map(([text, description]) => ({ text: text!, description })),
     ].filter(s => s.text.startsWith(e.token))
     return { suggestions: [...suggestions, ...(await next(e)).suggestions] }
+  })
+
+  on('ui.render', { component: 'AbovePrompt' }, async ($, e, next) => {
+    if (!band || e.props.hasSurvey) return next(e)
+    const { Box, Text } = $.ui.resolve(e)
+    const now = await $.clock.now()
+    const windows = (band.limits ?? []).map(l => {
+      const p = Math.min(Math.round(l.percentUsed), 100)
+      const fill = Math.round((p / 100) * BAR)
+      const reset = until(l.resetsAt, now)
+      return (
+        <Box key={l.kind} gap={1}>
+          <Text color="subtle">{WINDOWS[l.kind] ?? l.kind}</Text>
+          <Box>
+            <Text color={level(p)}>{'█'.repeat(fill)}</Text>
+            <Text color="subtle">{'░'.repeat(BAR - fill)}</Text>
+          </Box>
+          <Text color={level(p)}>{`${p}%`}</Text>
+          {reset ? <Text color="subtle">{`↻ ${reset}`}</Text> : null}
+        </Box>
+      )
+    })
+    return (
+      <Box gap={3}>
+        <Box gap={1}>
+          <Text color="success">●</Text>
+          <Text bold>{band.name}</Text>
+          {band.email && e.props.bodyColumns >= 90 ? <Text color="subtle">{band.email}</Text> : null}
+        </Box>
+        {windows}
+      </Box>
+    )
   })
 
   on('ui.render', { component: 'CommandOutput', props: { command: 'profile' } }, async ($, e, next) => {

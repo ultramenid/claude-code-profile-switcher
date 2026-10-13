@@ -21,6 +21,7 @@ function stage(on: any, answers: string[] = []) {
   on('command.run', { command: 'remote-control' }, () => (remote.push('run'), { text: '' }))
   const surfaces = ['terminal']
   on('session.surfaces', () => ({ value: surfaces }))
+  on('ui.status', () => ({ value: undefined }))
   on('env.get', (_$: any, e: any) => ({ value: env[e.name] }))
   on('env.set', (_$: any, e: any) => ((env[e.name] = e.value), { value: undefined }))
   mock.store(on)
@@ -127,6 +128,24 @@ test('plan usage from each response is kept per account', async ($, on) => {
   const usage = await $.command.run({ command: 'usage', args: '', origin: { kind: 'plugin', name: 'profile' }, presentation: { isFullscreen: false, columns: 80 } } as any)
   expect(usage.text).toContain('Plan usage · work (w@x)')
   expect(usage.text).toContain('5h  █░░░░░░░░░░░░░░░░░░░ 5%')
+})
+
+test('the band above the prompt shows the account and its usage', async ($, on) => {
+  const { clock } = stage(on)
+  await $.session.start({ source: 'startup', cwd: '/p' } as any)
+  const resetsAt = new Date(clock.now() + 125 * 60_000).toISOString()
+  await $.session.measure({ context: {} as any, rateLimits: [{ kind: 'five_hour', percentUsed: 62.4, resetsAt }], changed: ['rateLimits'] } as any)
+  for (const surface of ['terminal', 'desktop'] as const) {
+    const ui = await $.ui.mount({
+      plugin: 'profile', surface, component: 'AbovePrompt',
+      props: { hasSurvey: false, isWorking: false, maxRows: 10, bodyColumns: 120, scroll: { offset: 0, bodyRows: 10 }, view: {} },
+    })
+    expect(await ui.find({ text: 'main' })).toBeDefined()
+    expect(await ui.find({ text: 'me@x' })).toBeDefined()
+    expect((await ui.find({ type: 'Text', text: '62%' }))?.props.color).toBe('warning')
+    expect(await ui.find({ text: '↻ 2h 5m' })).toBeDefined()
+    await ui.unmount()
+  }
 })
 
 test('reconnects Remote Control after a switch when it is on at startup', async ($, on) => {
