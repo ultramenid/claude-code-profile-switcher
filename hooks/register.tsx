@@ -218,6 +218,20 @@ async function watchLogin($: EngineInterface) {
     if (pending.size) return // an add briefly swaps the login and puts it back
     if ((await signedIn($)) !== seen) await reconnectRemote($)
   })())
+  $.clock.every(60_000, () => void syncToken($).catch(() => undefined))
+}
+
+/**
+ * A switched session holds a copy of the access token, and refreshing it (any window
+ * does, near expiry) revokes that copy: take the fresh one from the live login or slot.
+ */
+async function syncToken($: EngineInterface) {
+  const held = await $.env.get('ANTHROPIC_AUTH_TOKEN')
+  const name = (await $.store.get(`using:${await $.session.id()}`)) as string | undefined
+  if (!held || !name) return
+  const login = name === (await current($)) ? await liveLogin($) : await slot($, name)
+  const tok = accessToken(login?.creds)
+  if (tok && tok !== held) await $.env.set('ANTHROPIC_AUTH_TOKEN', tok)
 }
 
 /** Makes `name`'s slot the live login. */
@@ -302,6 +316,8 @@ async function use($: EngineInterface, name: string): Promise<string> {
   // Back on the login this session started with: drop the token so usage and email return.
   const startedOn = (await $.store.get(`startedOn:${await $.session.id()}`)) as string | undefined
   await $.env.set('ANTHROPIC_AUTH_TOKEN', name === startedOn ? undefined : accessToken(login.creds))
+  const using = `using:${await $.session.id()}`
+  await (name === startedOn ? $.store.delete(using) : $.store.set(using, name))
   await show($)
   const email = login.oauthAccount?.emailAddress
   return [
@@ -382,6 +398,11 @@ export const register: Register = on => {
   })
 
   // Account names and verbs after `/profile `.
+  on('prompt.submit', async ($, e, next) => {
+    await syncToken($).catch(() => undefined)
+    return next(e)
+  })
+
   on('prompt.autocomplete', async ($, e, next) => {
     const m = /^\/profile\s+(?:(remove)\s+)?$/.exec(e.text.slice(0, e.start))
     if (!m) return next(e)

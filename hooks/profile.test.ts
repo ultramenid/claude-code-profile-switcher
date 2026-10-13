@@ -153,6 +153,21 @@ test('reconnects Remote Control when another window switches the login', async (
   expect(remote.length).toBe(1) // once per change
 })
 
+test('a switched session follows token refreshes, so its copy is never the revoked one', async ($, on) => {
+  const { keychain, env, signIn, clock } = stage(on)
+  await $.session.start({ source: 'startup', cwd: '/p' } as any)
+  await run($, 'add work')
+  signIn('t-work', 'w@x')
+  await clock.advance(3500)
+  await run($, 'work')
+  expect(env.ANTHROPIC_AUTH_TOKEN).toBe('t-work')
+  keychain['Claude Code-credentials|me'] = creds('t-work-2') // another window refreshed work
+  await clock.advance(60_000)
+  expect(env.ANTHROPIC_AUTH_TOKEN).toBe('t-work-2')
+  await run($, 'main') // back on the startup login: no copy to keep
+  expect(env.ANTHROPIC_AUTH_TOKEN).toBeUndefined()
+})
+
 test('bare /profile picks from a dialog, falls back to the list', async ($, on) => {
   const { signIn, clock } = stage(on, ['work (w@x)'])
   expect(await run($, '')).toContain('● main  me@x · active')
