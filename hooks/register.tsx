@@ -31,6 +31,35 @@ async function limits($: EngineInterface, name: string): Promise<Limit[] | undef
   return Array.isArray(l) ? (l as Limit[]) : undefined
 }
 
+// A switched session's own reading can still be the login it started with, so there
+// its account's windows come from the plan's usage endpoint (what /usage reads), asked
+// with the credential the session sends.
+const USAGE_URL = 'https://api.anthropic.com/api/oauth/usage'
+let usageNext = 0 // the endpoint takes a few reads a minute: once a minute, five after a 429
+
+/** The live credential's windows from the usage endpoint, kept as its account's reading; undefined off a subscription or on failure. */
+async function planUsage($: EngineInterface, force = false): Promise<Limit[] | undefined> {
+  const now = await $.clock.now()
+  if (!force && now < usageNext) return undefined
+  const auth = await $.session.authorize().catch(() => null)
+  if (auth?.kind !== 'bearer') return undefined
+  usageNext = now + 60_000
+  try {
+    const res = await $.http.fetch(USAGE_URL, { auth: auth.handle, headers: { 'anthropic-beta': 'oauth-2025-04-20' } })
+    if (res.status === 429) usageNext = now + 300_000
+    if (!res.ok) return undefined
+    const body = JSON.parse(res.text)
+    const list: Limit[] = Object.keys(WINDOWS).flatMap(kind => {
+      const w = body?.[kind]
+      return typeof w?.utilization === 'number' ? [{ kind, percentUsed: Math.round(w.utilization * 10) / 10, ...(w.resets_at ? { resetsAt: w.resets_at } : {}) }] : []
+    })
+    if (list.length) await $.store.set(`limits:${await current($)}`, list)
+    return list
+  } catch {
+    return undefined
+  }
+}
+
 async function usage($: EngineInterface, name: string): Promise<string | undefined> {
   return (await limits($, name))?.map(l => `${WINDOWS[l.kind] ?? l.kind} ${Math.round(l.percentUsed)}%`).join(' ')
 }
@@ -40,14 +69,14 @@ async function usagePanel($: EngineInterface, name: string): Promise<string> {
   const email = (await liveLogin($))?.oauthAccount?.emailAddress
   const list = await limits($, name)
   const when = (iso?: string) => (iso ? ` · resets ${new Date(iso).toLocaleString([], { weekday: 'short', hour: '2-digit', minute: '2-digit' })}` : '')
-  const bar = (p: number) => '█'.repeat(Math.round(Math.min(p, 100) / 5)).padEnd(20, '░')
+  const bar = (p: number) => '▰'.repeat(Math.round(Math.min(p, 100) / 5)).padEnd(20, '▱')
   return [
     `Plan usage · ${name}${email ? ` (${email})` : ''}`,
     ...(list?.length
       ? list.map(l => `${(WINDOWS[l.kind] ?? l.kind).padEnd(3)} ${bar(l.percentUsed)} ${Math.round(l.percentUsed)}%${when(l.resetsAt)}`)
       : ['No reading yet: send a message first.']),
     '',
-    'From response headers (this session switched with /profile). Reopen Claude Code for the full /usage.',
+    'From the plan\'s usage figures, read at most once a minute (this session switched with /profile). Reopen Claude Code for the full /usage.',
   ].join('\n')
 }
 
@@ -326,11 +355,11 @@ async function writeStatus($: EngineInterface) {
   const head = [paint('success', '●'), paint('bold', band.name), band.email && paint('subtle', band.email)]
   const windows = meters(band.limits, await $.clock.now()).map(m => [
     paint('subtle', m.label),
-    paint(m.color, '█'.repeat(m.fill)) + paint('subtle', '░'.repeat(BAR - m.fill)),
+    paint(m.color, '▰'.repeat(m.fill)) + paint('subtle', '▱'.repeat(BAR - m.fill)),
     paint(m.color, `${m.p}%`),
     m.reset && paint('subtle', `↻ ${m.reset}`),
   ])
-  const line = [head, ...windows].map(part => part.filter(Boolean).join(' ')).join('   ')
+  const line = [head, ...windows].map(part => part.filter(Boolean).join(' ')).join(paint('subtle', ' │ '))
   const h = await home($)
   await $.fs.write(`${h}/.claude/profile-status.txt`, `${line}\n`)
   // This session's whole status line, which profile-statusline.sh prints.
@@ -367,7 +396,7 @@ function sessionLine(model: string, ctx: { tokens?: number; window: number; perc
     paint('accent', `Model: ${modelName(model)}`) + '@EFFORT@',
     paint(level(p), `Ctx: ${short(used)}`),
     hit !== undefined && paint(level(100 - hit), `Cache: ${hit}%`),
-    `${paint(level(p), `Context: ${'█'.repeat(fill)}`)}${paint('subtle', '░'.repeat(BAR - fill))} ${paint(level(p), `${short(used)}/${short(ctx.window)} (${p}%)`)}`,
+    `${paint(level(p), `Context: ${'▰'.repeat(fill)}`)}${paint('subtle', '▱'.repeat(BAR - fill))} ${paint(level(p), `${short(used)}/${short(ctx.window)} (${p}%)`)}`,
   ].filter(Boolean).join(paint('subtle', ' | '))
 }
 
@@ -463,6 +492,7 @@ async function use($: EngineInterface, name: string): Promise<string> {
   await $.env.set('ANTHROPIC_AUTH_TOKEN', name === startedOn ? undefined : accessToken(login.creds))
   const using = `using:${await $.session.id()}`
   await (name === startedOn ? $.store.delete(using) : $.store.set(using, name))
+  await planUsage($, true)
   await show($)
   const email = login.oauthAccount?.emailAddress
   return [
@@ -593,7 +623,8 @@ let failing: Promise<boolean> | undefined // parallel subagents hit the limit to
 async function failover($: EngineInterface): Promise<boolean> {
   if (await onApi($)) return false // API credit is the last stop
   const now = await $.clock.now()
-  const { rateLimits } = await $.session.usage()
+  const isSwitched = !!(await $.env.get('ANTHROPIC_AUTH_TOKEN'))
+  const rateLimits = (isSwitched ? await planUsage($, true) : undefined) ?? (await $.session.usage()).rateLimits
   if (!isOut(rateLimits, now)) return false // failed for another reason
   const from = await current($)
   await $.store.set(`limits:${from}`, rateLimits) // so no fallback picks it till it resets
@@ -680,7 +711,11 @@ export const register: Register = on => {
 
   on('session.measure', async ($, e, next) => {
     const r = await next(e)
-    if (e.changed.includes('rateLimits') && e.rateLimits.length && !(await onApi($))) {
+    if (await onApi($)) await writeStatus($)
+    else if (await $.env.get('ANTHROPIC_AUTH_TOKEN')) {
+      await planUsage($) // a switched token: the engine's reading may be the login it started with
+      await show($)
+    } else if (e.changed.includes('rateLimits') && e.rateLimits.length) {
       await $.store.set(`limits:${await current($)}`, e.rateLimits)
       await show($)
     } else await writeStatus($) // context or cost
@@ -793,29 +828,29 @@ export const register: Register = on => {
       <Box key={m.kind} gap={1}>
         <Text color="subtle">{m.label}</Text>
         <Box>
-          <Text color={m.color}>{'█'.repeat(m.fill)}</Text>
-          <Text color="subtle">{'░'.repeat(BAR - m.fill)}</Text>
+          <Text color={m.color}>{'▰'.repeat(m.fill)}</Text>
+          <Text color="subtle">{'▱'.repeat(BAR - m.fill)}</Text>
         </Box>
         <Text color={m.color}>{`${m.p}%`}</Text>
         {m.reset ? <Text color="subtle">{`↻ ${m.reset}`}</Text> : null}
       </Box>
     ))
-    return (
-      <Box gap={3}>
-        <Box gap={1}>
-          <Text color="success">●</Text>
-          <Text bold>{band.name}</Text>
-          {band.email && e.props.bodyColumns >= 90 ? <Text color="subtle">{band.email}</Text> : null}
-        </Box>
-        {windows}
-        {band.cache !== undefined ? (
-          <Box gap={1}>
-            <Text color="subtle">Cache</Text>
-            <Text color={level(100 - band.cache)}>{`${band.cache}%`}</Text>
-          </Box>
-        ) : null}
-      </Box>
-    )
+    const groups = [
+      <Box key="account" gap={1}>
+        <Text color="success">●</Text>
+        <Text bold>{band.name}</Text>
+        {band.email && e.props.bodyColumns >= 90 ? <Text color="subtle">{band.email}</Text> : null}
+      </Box>,
+      ...windows,
+      ...(band.cache !== undefined ? [
+        <Box key="cache" gap={1}>
+          <Text color="subtle">Cache</Text>
+          <Text color={level(100 - band.cache)}>{`${band.cache}%`}</Text>
+        </Box>,
+      ] : []),
+    ]
+    // │ between the groups, as the status line's row has it
+    return <Box gap={1}>{groups.flatMap((g, i) => (i ? [<Text key={`sep${i}`} color="subtle">│</Text>, g] : [g]))}</Box>
   })
 
   // /profile add api's paste box: the key reaches this plugin alone, never the prompt.

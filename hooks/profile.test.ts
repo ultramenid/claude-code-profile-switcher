@@ -35,7 +35,13 @@ function stage(on: any, answers: string[] = []) {
   on('session.authorize', () => {
     const approved: string[] = JSON.parse(files['/home/u/.claude.json']!).customApiKeyResponses?.approved ?? []
     const isKey = !env.ANTHROPIC_AUTH_TOKEN && !!env.ANTHROPIC_API_KEY && approved.includes(env.ANTHROPIC_API_KEY.slice(-20))
-    return { value: { handle: 'h', kind: isKey ? 'api-key' : 'bearer' } }
+    return { value: { handle: isKey ? 'key' : env.ANTHROPIC_AUTH_TOKEN ?? 't-main', kind: isKey ? 'api-key' : 'bearer' } }
+  })
+  // The plan's usage endpoint, answering for the credential the session sends.
+  const plan: Record<string, Record<string, { utilization: number; resets_at?: string }>> = {}
+  on('http.fetch', (_$: any, e: any) => {
+    const body = e.url === 'https://api.anthropic.com/api/oauth/usage' ? plan[e.init?.auth] : undefined
+    return { value: body ? { status: 200, ok: true, headers: {}, text: JSON.stringify(body) } : { status: 401, ok: false, headers: {}, text: '' } }
   })
   on('ui.open', (_$: any, e: any) => (panes.add(e.id), { value: { isPlaced: true } }))
   on('ui.close', (_$: any, e: any) => (panes.delete(e.id), { value: undefined }))
@@ -76,7 +82,7 @@ function stage(on: any, answers: string[] = []) {
     files['/home/u/.claude.json'] = JSON.stringify({ ...JSON.parse(files['/home/u/.claude.json']!), oauthAccount: { emailAddress: email } })
   }
   const liveEmail = () => JSON.parse(files['/home/u/.claude.json']!).oauthAccount.emailAddress
-  return { keychain, env, argvs, signIn, liveEmail, clock, files, remote, surfaces, rateLimits, panes }
+  return { keychain, env, argvs, signIn, liveEmail, clock, files, remote, surfaces, rateLimits, panes, plan }
 }
 
 test('add captures a full login and puts the current one back; switching swaps the live login', async ($, on) => {
@@ -127,20 +133,27 @@ test('switching back to the login the session started on drops the token', async
   expect(env.ANTHROPIC_AUTH_TOKEN).toBeUndefined()
 })
 
-test('plan usage from each response is kept per account', async ($, on) => {
-  const { signIn, clock } = stage(on)
+test('plan usage is kept per account; a switched one reads its own from the plan, not the reading of the login the session started on', async ($, on) => {
+  const { signIn, clock, plan, files } = stage(on)
   const measure = (five: number, seven: number) =>
     $.session.measure({ context: {} as any, rateLimits: [{ kind: 'five_hour', percentUsed: five }, { kind: 'seven_day', percentUsed: seven }], changed: ['rateLimits'] })
+  const row = () => files['/home/u/.claude/profile-status.txt']!.replace(/\x1b\[\d+m/g, '')
   await measure(23.4, 40)
   await run($, 'add work')
   signIn('t-work', 'w@x')
   await clock.advance(3000)
+  plan['t-work'] = { five_hour: { utilization: 5 }, seven_day: { utilization: 12 } }
   await run($, 'work')
-  await measure(5, 12)
+  expect(row()).toBe('● work w@x │ 5h ▰▱▱▱▱▱▱▱▱▱ 5% │ 7d ▰▱▱▱▱▱▱▱▱▱ 12%\n') // read on the switch
+  await measure(24, 41) // the engine still reading main's windows: not work's
   expect(await run($, 'list')).toContain('○ main  me@x · 5h 23% 7d 40%\n● work  w@x · 5h 5% 7d 12% · active')
+  plan['t-work'] = { five_hour: { utilization: 9 }, seven_day: { utilization: 13 } }
+  await clock.advance(61_000)
+  await measure(25, 41) // a minute on, the next turn reads work's again
+  expect(row()).toBe('● work w@x │ 5h ▰▱▱▱▱▱▱▱▱▱ 9% │ 7d ▰▱▱▱▱▱▱▱▱▱ 13%\n')
   const usage = await $.command.run({ command: 'usage', args: '', origin: { kind: 'plugin', name: 'profile' }, presentation: { isFullscreen: false, columns: 80 } } as any)
   expect(usage.text).toContain('Plan usage · work (w@x)')
-  expect(usage.text).toContain('5h  █░░░░░░░░░░░░░░░░░░░ 5%')
+  expect(usage.text).toContain('5h  ▰▰▱▱▱▱▱▱▱▱▱▱▱▱▱▱▱▱▱▱ 9%\n7d  ▰▰▰▱▱▱▱▱▱▱▱▱▱▱▱▱▱▱▱▱ 13%')
 })
 
 test('a request refused for a used-up plan goes again on another account: asked first, by itself during a /goal', async ($, on) => {
@@ -290,9 +303,9 @@ test('a weekly bar shows only on an account with a weekly limit', async ($, on) 
   await $.session.start({ source: 'startup', cwd: '/p' } as any)
   const row = () => files['/home/u/.claude/profile-status.txt']!.replace(/\x1b\[\d+m/g, '')
   await $.session.measure({ context: {} as any, rateLimits: [{ kind: 'five_hour', percentUsed: 5 }, { kind: 'seven_day', percentUsed: 40 }], changed: ['rateLimits'] })
-  expect(row()).toBe('● main me@x   5h █░░░░░░░░░ 5%   7d ████░░░░░░ 40%\n')
+  expect(row()).toBe('● main me@x │ 5h ▰▱▱▱▱▱▱▱▱▱ 5% │ 7d ▰▰▰▰▱▱▱▱▱▱ 40%\n')
   await $.session.measure({ context: {} as any, rateLimits: [{ kind: 'five_hour', percentUsed: 6 }], changed: ['rateLimits'] })
-  expect(row()).toBe('● main me@x   5h █░░░░░░░░░ 6%\n')
+  expect(row()).toBe('● main me@x │ 5h ▰▱▱▱▱▱▱▱▱▱ 6%\n')
 })
 
 test('the band above the prompt shows the account and its usage', async ($, on) => {
@@ -308,12 +321,12 @@ test('the band above the prompt shows the account and its usage', async ($, on) 
   })
   // The same row, coloured, for a status line to print.
   const plain = (path: string) => files[path]!.replace(/\x1b\[\d+m/g, '')
-  expect(plain('/home/u/.claude/profile-status.txt')).toBe('● main me@x   5h ██████░░░░ 62% ↻ 2h 5m\n')
+  expect(plain('/home/u/.claude/profile-status.txt')).toBe('● main me@x │ 5h ▰▰▰▰▰▰▱▱▱▱ 62% ↻ 2h 5m\n')
   // And this session's whole status line, ccstatusline's line above it, for profile-statusline.sh.
   await $.turn.complete({ reason: 'answer', answer: 'ok', durationMs: 1000, isAborted: false, turnId: 't1', usage: { input_tokens: 1000, output_tokens: 500, cache_read_input_tokens: 98_500, cache_creation_input_tokens: 0, model: 'claude-opus-5-5' } } as any)
   await measure()
   expect(plain('/home/u/.claude/profile-statusline/sess-1.txt')).toBe(
-    'Model: Opus 5.5@EFFORT@ | Ctx: 216.3k | Cache: 99% | Context: ██░░░░░░░░ 216.3k/1.0M (22%)\n● main me@x   5h ██████░░░░ 62% ↻ 2h 5m\n')
+    'Model: Opus 5.5@EFFORT@ | Ctx: 216.3k | Cache: 99% | Context: ▰▰▱▱▱▱▱▱▱▱ 216.3k/1.0M (22%)\n● main me@x │ 5h ▰▰▰▰▰▰▱▱▱▱ 62% ↻ 2h 5m\n')
   expect(files['/home/u/.claude/profile-statusline.sh']).toContain('profile-statusline/$id.txt')
   for (const surface of ['terminal', 'desktop'] as const) {
     const ui = await $.ui.mount({
