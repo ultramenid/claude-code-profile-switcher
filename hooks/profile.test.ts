@@ -19,7 +19,8 @@ function stage(on: any, answers: string[] = []) {
   const argvs: string[] = []
   const remote: string[] = []
   on('command.run', { command: 'remote-control' }, () => (remote.push('run'), { text: '' }))
-  on('session.surfaces', () => ({ value: ['terminal'] }))
+  const surfaces = ['terminal']
+  on('session.surfaces', () => ({ value: surfaces }))
   on('env.get', (_$: any, e: any) => ({ value: env[e.name] }))
   on('env.set', (_$: any, e: any) => ((env[e.name] = e.value), { value: undefined }))
   mock.store(on)
@@ -61,7 +62,7 @@ function stage(on: any, answers: string[] = []) {
     files['/home/u/.claude.json'] = JSON.stringify({ ...JSON.parse(files['/home/u/.claude.json']!), oauthAccount: { emailAddress: email } })
   }
   const liveEmail = () => JSON.parse(files['/home/u/.claude.json']!).oauthAccount.emailAddress
-  return { keychain, env, argvs, signIn, liveEmail, clock, files, remote }
+  return { keychain, env, argvs, signIn, liveEmail, clock, files, remote, surfaces }
 }
 
 test('add captures a full login and puts the current one back; switching swaps the live login', async ($, on) => {
@@ -138,6 +139,21 @@ test('reconnects Remote Control after a switch when it is on at startup', async 
   await run($, 'work')
   await clock.advance(500)
   expect(remote.length).toBe(2) // after add put main back, and after the switch
+})
+
+test('reconnects Remote Control for a phone attached, not for the desktop app', async ($, on) => {
+  const { remote, signIn, clock, surfaces } = stage(on)
+  await run($, 'add work')
+  signIn('t-work', 'w@x')
+  await clock.advance(3500)
+  surfaces.splice(0, 1, 'desktop')
+  await run($, 'work')
+  await clock.advance(500)
+  expect(remote.length).toBe(0)
+  surfaces.push('mobile')
+  await run($, 'main')
+  await clock.advance(500)
+  expect(remote.length).toBe(1)
 })
 
 test('reconnects Remote Control when another window switches the login', async ($, on) => {

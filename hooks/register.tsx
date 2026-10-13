@@ -198,7 +198,7 @@ async function save($: EngineInterface, name: string) {
 async function reconnectRemote($: EngineInterface) {
   seen = await signedIn($)
   const settings = JSON.parse(await $.fs.read(`${await home($)}/.claude/settings.json`).catch(() => '{}'))
-  const attached = (await $.session.surfaces().catch(() => [])).some(s => s !== 'terminal')
+  const attached = (await $.session.surfaces().catch(() => [])).includes('mobile') // a Remote Control client; the desktop app runs Claude Code locally
   // From a timer, outside the /profile run: a command can't start inside the one running.
   if (settings.remoteControlAtStartup || attached)
     $.clock.after(500, () => void $.command.run({ command: 'remote-control', args: '' }).catch(() => undefined))
