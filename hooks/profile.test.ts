@@ -333,7 +333,7 @@ test('plan usage is kept per account; a switched one reads its own from the plan
 })
 
 test('a request refused for a used-up plan goes again on another account: asked first, by itself during a /goal', async ($, on) => {
-  const { env, signIn, clock, rateLimits, keychain, toasts } = stage(on, ['Switch to work'])
+  const { env, signIn, clock, rateLimits, keychain, toasts, files, holdUsage } = stage(on, ['Switch to work'])
   const sent: (string | undefined)[] = []
   on('command.run', { command: 'goal' }, () => ({ text: '' }))
   on('turn.step', async function* (_$: any, e: any) { // the API: main, the login the session started on, is used up
@@ -354,7 +354,12 @@ test('a request refused for a used-up plan goes again on another account: asked 
   signIn('t-work', 'w@x')
   await clock.advance(3000)
 
-  expect((await step()).answer).toBe('ok') // asked, and agreed
+  const held = holdUsage('t-work')
+  const agreed = step()
+  await held.reached
+  expect(files['/home/u/.claude/profile-statusline/sess-1.txt']).toContain('w@x') // the row names work before its usage arrives
+  held.open()
+  expect((await agreed).answer).toBe('ok') // asked, and agreed
   expect(sent).toEqual([undefined, 't-work'])
   expect(await run($, 'list')).toContain('○ main  me@x · 5h 100%')
 
@@ -526,11 +531,41 @@ test('the status line is set once, and only where none was', async ($, on) => {
   await $.session.start({ source: 'startup', cwd: '/p' } as any)
   expect(JSON.parse(files[path]!)).toEqual({
     enabledPlugins: { 'profile@x': true },
-    statusLine: { type: 'command', command: 'sh ~/.claude/profile-statusline.sh', refreshInterval: 10 },
+    statusLine: { type: 'command', command: 'sh ~/.claude/profile-statusline.sh', refreshInterval: 1 },
   })
   files[path] = '{}' // the user took it out
   await $.session.start({ source: 'startup', cwd: '/p' } as any)
   expect(files[path]).toBe('{}')
+  // set by a version that re-ran it every 10s: once a second now; an interval of the user's own stays
+  files[path] = '{"statusLine": {"type": "command", "command": "sh ~/.claude/profile-statusline.sh", "refreshInterval": 10}}'
+  await $.session.start({ source: 'startup', cwd: '/p' } as any)
+  expect(JSON.parse(files[path]!).statusLine.refreshInterval).toBe(1)
+  files[path] = '{"statusLine": {"type": "command", "command": "sh ~/.claude/profile-statusline.sh", "refreshInterval": 5}}'
+  await $.session.start({ source: 'startup', cwd: '/p' } as any)
+  expect(JSON.parse(files[path]!).statusLine.refreshInterval).toBe(5)
+})
+
+test('a desktop app session: shown as the app\'s account, and never switched, since Claude Code there sends only that', async ($, on) => {
+  const { env, signIn, clock, files, keychain } = stage(on)
+  await run($, 'add work')
+  signIn('t-work', 'w@x')
+  await clock.advance(3000)
+  keychain['cc-swap-login|api'] = JSON.stringify({ apiKey: 'sk-ant-api03-test-0123456789abcdefghijWXYZ' })
+  Object.assign(env, { CLAUDE_CODE_ENTRYPOINT: 'claude-desktop', CLAUDE_CODE_USER_EMAIL: 'w@x' })
+  env.CLAUDE_PROFILE_USING = 'main' // switched by an earlier version, to no effect
+  env.ANTHROPIC_AUTH_TOKEN = 't-main'
+  await $.session.start({ source: 'startup', cwd: '/p' } as any)
+  expect(await run($, 'list')).toContain('● work') // the app's account, not the live login (main)
+  expect(env.CLAUDE_PROFILE_USING).toBeUndefined()
+  expect(env.ANTHROPIC_AUTH_TOKEN).toBeUndefined()
+
+  const config = files['/home/u/.claude.json']
+  expect(await run($, 'main')).toContain('always uses the app\'s own account')
+  expect(await run($, 'api')).toContain('always uses the app\'s own account')
+  expect(files['/home/u/.claude.json']).toBe(config) // nothing switched, no key approved
+  expect(env.ANTHROPIC_AUTH_TOKEN).toBeUndefined()
+  expect(env.ANTHROPIC_API_KEY).toBeUndefined()
+  expect(await run($, '')).toContain('Accounts') // no picker of accounts it can't switch to
 })
 
 test('a status line of the user\'s own is kept', async ($, on) => {
@@ -620,7 +655,7 @@ test('the band above the prompt shows the account and its usage', async ($, on) 
   await $.turn.complete({ reason: 'answer', answer: 'ok', durationMs: 1000, isAborted: false, turnId: 't1', usage: { input_tokens: 1000, output_tokens: 500, cache_read_input_tokens: 98_500, cache_creation_input_tokens: 0, model: 'claude-opus-5-5' } } as any)
   await measure()
   expect(plain('/home/u/.claude/profile-statusline/sess-1.txt')).toBe(
-    'Model: Opus 5.5@EFFORT@ | Ctx: 216.3k | Cache: 99% | Context: ▰▰▱▱▱▱▱▱▱▱ 216.3k/1.0M (22%)\n● main me@x │ 5h ▰▰▰▰▰▰▱▱▱▱ 62% ↻ 2h 5m\n')
+    'Model: Opus 5.5@EFFORT@ | Ctx: 216.3k | Cache: 99% | Context: ▰▰▱▱▱▱▱▱▱▱ 216.3k/1.0M (22%)\n● main me@x │ 5h ▰▰▰▰▰▰▱▱▱▱ 62% ↻ @R7500@\n') // the script counts down to it
   expect(files['/home/u/.claude/profile-statusline.sh']).toContain('profile-statusline/$id.txt')
   for (const surface of ['terminal', 'desktop'] as const) {
     const ui = await $.ui.mount({

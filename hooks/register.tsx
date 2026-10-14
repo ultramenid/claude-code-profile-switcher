@@ -436,7 +436,8 @@ function meters(list: Limit[] | undefined, now: number) {
   const order = (kind: string) => (Object.keys(WINDOWS).indexOf(kind) + 1 || 99)
   return [...(list ?? [])].sort((a, b) => order(a.kind) - order(b.kind)).map(l => {
     const p = Math.min(Math.round(l.percentUsed), 100)
-    return { kind: l.kind, label: WINDOWS[l.kind] ?? l.kind, p, fill: Math.round((p / 100) * BAR), color: level(p), reset: until(l.resetsAt, now) }
+    const at = l.resetsAt ? Math.round(Date.parse(l.resetsAt) / 1000) : NaN
+    return { kind: l.kind, label: WINDOWS[l.kind] ?? l.kind, p, fill: Math.round((p / 100) * BAR), color: level(p), reset: until(l.resetsAt, now), at }
   })
 }
 
@@ -449,21 +450,22 @@ let compacted: { sid: string; tokens: number } | undefined // the size after thi
 async function writeStatus($: EngineInterface) {
   if (!band) return
   const head = [paint('success', '●'), paint('bold', band.name), band.email && paint('subtle', band.email)]
-  const windows = meters(band.limits, await $.clock.now()).map(m => [
+  const all = meters(band.limits, await $.clock.now())
+  // `@R<epoch seconds>@`: a countdown profile-statusline.sh works out each time it prints, so it's never behind.
+  const row = (isLive: boolean) => [head, ...all.map(m => [
     paint('subtle', m.label),
     paint(m.color, '▰'.repeat(m.fill)) + paint('subtle', '▱'.repeat(BAR - m.fill)),
     paint(m.color, `${m.p}%`),
-    m.reset && paint('subtle', `↻ ${m.reset}`),
-  ])
-  const line = [head, ...windows].map(part => part.filter(Boolean).join(' ')).join(paint('subtle', ' │ '))
+    m.reset && paint('subtle', `↻ ${isLive && Number.isFinite(m.at) ? `@R${m.at}@` : m.reset}`),
+  ])].map(part => part.filter(Boolean).join(' ')).join(paint('subtle', ' │ '))
   const h = await home($)
-  await $.fs.write(`${h}/.claude/profile-status.txt`, `${line}\n`)
+  await $.fs.write(`${h}/.claude/profile-status.txt`, `${row(false)}\n`)
   // This session's whole status line, which profile-statusline.sh prints.
   const sid = await $.session.id()
   const top = await Promise.all([$.session.model(), $.session.usage(), $.store.get(`cache:${sid}`)])
     .then(([model, u, cache]) => sessionLine(model, compacted?.sid === sid ? { window: u.context.window, tokens: compacted.tokens } : u.context, cache as Cache | undefined))
     .catch(() => undefined)
-  await $.fs.write(`${h}/.claude/profile-statusline/${sid}.txt`, `${top ? `${top}\n` : ''}${line}\n`)
+  await $.fs.write(`${h}/.claude/profile-statusline/${sid}.txt`, `${top ? `${top}\n` : ''}${row(true)}\n`)
 }
 
 /** `950`, `216.3k`, `1.0M` */
@@ -498,6 +500,7 @@ function sessionLine(model: string, ctx: { tokens?: number; window: number; perc
 }
 
 // Claude Code's status line runs this: "statusLine": { "type": "command", "command": "sh ~/.claude/profile-statusline.sh" }.
+const STATUSLINE_COMMAND = 'sh ~/.claude/profile-statusline.sh'
 const STATUSLINE = `#!/bin/sh
 # Written by the profile plugin: prints the status line it keeps for this session.
 in=$(tr -d '\\n')
@@ -506,8 +509,20 @@ id=$(field session_id '"\\([^"]*\\)"')
 effort=$(field effort '{[[:space:]]*"level"[[:space:]]*:[[:space:]]*"\\([a-z0-9]*\\)"')
 [ -n "$effort" ] && effort=$(printf '\\033[90m | \\033[0m\\033[35mEffort: %s\\033[0m' "$effort")
 f="$HOME/.claude/profile-statusline/$id.txt"
+# @EFFORT@ from the input above; @R<epoch seconds>@ as the time till then: 45m, 2h 5m, 3d 4h
+fill() {
+  awk -v now="$(date +%s)" -v effort="$effort" '{
+    gsub(/@EFFORT@/, effort)
+    while (match($0, /@R[0-9]+@/)) {
+      m = (substr($0, RSTART + 2, RLENGTH - 3) - now) / 60; m = m > 0 ? int(m + 0.5) : 0
+      d = int(m / 1440); h = int((m % 1440) / 60)
+      $0 = substr($0, 1, RSTART - 1) (d ? d "d " h "h" : h ? h "h " m % 60 "m" : m "m") substr($0, RSTART + RLENGTH)
+    }
+    print
+  }'
+}
 # row: this session's account row alone, for a status line of your own (ccstatusline's Custom Command)
-if [ "$1" = row ]; then tail -n 1 "$f" 2>/dev/null; else sed "s/@EFFORT@/$effort/" "$f" 2>/dev/null; fi || true
+{ if [ "$1" = row ]; then tail -n 1 "$f"; else cat "$f"; fi; } 2>/dev/null | fill || true
 `
 
 /**
@@ -515,13 +530,20 @@ if [ "$1" = row ]; then tail -n 1 "$f" 2>/dev/null; else sed "s/@EFFORT@/$effort
  * someone's own), and never again after, so removing it keeps it removed.
  */
 async function claimStatusLine($: EngineInterface) {
-  if ((await $.store.get('statusLineClaimed')) || (await platform($)) === 'win') return
+  if ((await platform($)) === 'win') return
   const path = `${await home($)}/.claude/settings.json`
   const settings = await $.fs.read(path).then(JSON.parse).catch(() => undefined) // unreadable: leave it be, look again next time
   if (!settings) return
+  // Claude Code runs it as a response lands, often before the plugin has written that response's
+  // figures: once a second catches them. 10, the interval before 0.4.4, left them up to 10s behind.
+  if (settings.statusLine?.command === STATUSLINE_COMMAND && settings.statusLine.refreshInterval === 10) {
+    settings.statusLine.refreshInterval = 1
+    await $.fs.write(path, `${JSON.stringify(settings, null, 2)}\n`)
+  }
+  if (await $.store.get('statusLineClaimed')) return
   await $.store.set('statusLineClaimed', true)
   if (settings.statusLine) return
-  settings.statusLine = { type: 'command', command: 'sh ~/.claude/profile-statusline.sh', refreshInterval: 10 }
+  settings.statusLine = { type: 'command', command: STATUSLINE_COMMAND, refreshInterval: 1 }
   await $.fs.write(path, `${JSON.stringify(settings, null, 2)}\n`)
   $.ui.toast('Status line set to the profile plugin\'s: remove "statusLine" from ~/.claude/settings.json to undo')
 }
@@ -656,6 +678,7 @@ const use = ($: EngineInterface, name: string) => serial(() => (name === API ? s
 const useApi = ($: EngineInterface, isAuto: boolean) => serial(() => switchToApi($, isAuto))
 
 async function switchTo($: EngineInterface, name: string): Promise<string> {
+  if (await isDesktop($)) return DESKTOP
   const wasApi = await onApi($)
   if (name === (await active($))) return `✓ Already on ${name}`
   const cur = await current($)
@@ -673,6 +696,7 @@ async function switchTo($: EngineInterface, name: string): Promise<string> {
   const isStart = name === (await startedOn($))
   await $.env.set('ANTHROPIC_AUTH_TOKEN', isStart ? undefined : accessToken(login.creds))
   await $.env.set('CLAUDE_PROFILE_USING', isStart ? undefined : name)
+  await show($) // the new name now: the usage read below can take seconds
   await planUsage($, true)
   await show($)
   const email = login.oauthAccount?.emailAddress
@@ -694,6 +718,22 @@ const KEY_PANE = 'profile-api-key'
 // the token they go with: a /clear (a new session id) keeps them, a resume (a new process) starts over.
 const using = ($: EngineInterface) => $.env.get('CLAUDE_PROFILE_USING')
 const startedOn = ($: EngineInterface) => $.env.get('CLAUDE_PROFILE_STARTED_ON')
+
+// The desktop app signs each of its sessions in with its own account, and Claude Code there sends
+// that whatever ANTHROPIC_AUTH_TOKEN or ANTHROPIC_API_KEY say: no switch can move such a session.
+const isDesktop = async ($: EngineInterface) => (await $.env.get('CLAUDE_CODE_ENTRYPOINT')) === 'claude-desktop'
+const DESKTOP = "! A desktop app session always uses the app's own account: Claude Code there ignores another login or an API key · switch accounts in the app, or run /profile in claude in a terminal"
+
+/** The desktop app's account: its saved name, else its email. */
+async function desktopAccount($: EngineInterface): Promise<string> {
+  const account = { accountUuid: await $.env.get('CLAUDE_CODE_ACCOUNT_UUID'), emailAddress: await $.env.get('CLAUDE_CODE_USER_EMAIL') }
+  try {
+    for (const name of await names($)) if (name !== API && sameAccount(account, (await slot($, name))?.oauthAccount)) return name
+  } catch {
+    // the Keychain unreadable for a moment: the email stands in
+  }
+  return account.emailAddress ?? 'desktop'
+}
 
 /** Whether this session bills the `api` profile. */
 const onApi = async ($: EngineInterface) => (await using($)) === API
@@ -745,6 +785,7 @@ const sends = ($: EngineInterface) => $.session.authorize().then(a => a?.kind, (
 
 /** Bills this session to the `api` profile; `isAuto` when every account ran out, so it comes back by itself. */
 async function switchToApi($: EngineInterface, isAuto: boolean): Promise<string> {
+  if (await isDesktop($)) return DESKTOP
   const key = await apiKey($)
   if (!key) return `! No API credit set up · /profile add ${API} and paste your Console API key`
   if (await onApi($)) {
@@ -837,7 +878,7 @@ async function awaitSwitch($: EngineInterface, switched: Promise<boolean>, signa
  * the person agrees.
  */
 async function failover($: EngineInterface): Promise<boolean> {
-  if (await onApi($)) return false // API credit is the last stop
+  if ((await onApi($)) || (await isDesktop($))) return false // API credit is the last stop; a desktop session can't move
   const isGoal = await $.store.get(`goal:${await $.session.id()}`)
   if (!isGoal && declined === (await credential($))) return false // asked already: steps in flight ran out too
   const now = await $.clock.now()
@@ -902,7 +943,7 @@ async function remove($: EngineInterface, name: string): Promise<string> {
 
 /** `/profile` alone: a picker of the other signed-in accounts; undefined = show the list instead. */
 async function pick($: EngineInterface): Promise<string | undefined> {
-  const others = (await rows($)).filter(r => !r.isActive && !r.isPending).slice(0, 3)
+  const others = (await isDesktop($)) ? [] : (await rows($)).filter(r => !r.isActive && !r.isPending).slice(0, 3)
   if (others.length === 0) return undefined
   const labels = others.map(r => (r.email ? `${r.name} (${r.email})` : r.name))
   let answer: string
@@ -952,7 +993,14 @@ export const register: Register = on => {
     }
     // The login this process loaded; a reload mid-switch (token set) keeps the first answer. A Keychain
     // or ~/.claude.json caught mid-write gets a second try; failing that the live login stands in.
-    if (!(await $.env.get('ANTHROPIC_AUTH_TOKEN')) && !(await startedOn($))) {
+    if (await isDesktop($)) {
+      await $.env.set('CLAUDE_PROFILE_STARTED_ON', await desktopAccount($))
+      if (await using($)) { // switched by a version before 0.4.4, to no effect
+        await $.env.set('CLAUDE_PROFILE_USING', undefined)
+        await $.env.set('ANTHROPIC_AUTH_TOKEN', undefined)
+        await leaveApi($)
+      }
+    } else if (!(await $.env.get('ANTHROPIC_AUTH_TOKEN')) && !(await startedOn($))) {
       const first = await current($).catch(() => current($)).catch(() => undefined)
       if (first) await $.env.set('CLAUDE_PROFILE_STARTED_ON', first)
     }
