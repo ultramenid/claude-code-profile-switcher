@@ -8,7 +8,7 @@ Switch Claude Code's login between accounts with `/profile`. Each account is a f
 /plugin install profile --marketplace ultramenid/claude-code-profile-switcher
 ```
 
-Works in the terminal and in the Code tab of the Claude desktop app: both run Claude Code with the same plugins and the same login, so a switch in one applies to the other.
+Works in the terminal. In the Code tab of the Claude desktop app, the account row, `/profile list`, `add` and `remove` work too, but switching doesn't: the app signs each of its sessions in with its own account, and Claude Code there ignores any other login or API key. Switch the app's account in the app.
 
 > [!WARNING]
 > **Switch only with `/profile`.** Claude Code refreshes the live login every few hours, and the old refresh key stops working. The plugin saves the latest version when you switch away with `/profile`. If the login changes another way (you run `/login`, or another open Claude Code window writes its old login back), that account's saved copy may stop working, and switching to it leaves you logged out.
@@ -71,7 +71,7 @@ None: the first time it runs, the plugin sets itself as the status line. It neve
 To switch from your own status line to the plugin's, set this in `~/.claude/settings.json`:
 
 ```json
-"statusLine": { "type": "command", "command": "sh ~/.claude/profile-statusline.sh", "refreshInterval": 10 }
+"statusLine": { "type": "command", "command": "sh ~/.claude/profile-statusline.sh", "refreshInterval": 1 }
 ```
 
 To keep your own status line and add just the account row to it, run `sh ~/.claude/profile-statusline.sh row` with the status line's input on stdin: it prints this session's row (in ccstatusline: a Custom Command widget running it, with preserve colors on). `~/.claude/profile-status.txt` holds the row of whichever window wrote last.
@@ -101,6 +101,7 @@ The status line is a small script, `~/.claude/profile-statusline.sh`, that print
 - **This session after a switch:** it loaded its login at start, so until you reopen, requests use the new account's access token, while Claude Code's own `/status` and claude.ai connectors still use the account the session started on. Plan usage still works: the plugin reads the new account's 5-hour and 7-day usage from the plan's usage figures as it switches and at most once a minute after, and `/usage`, `/profile list`, the status line and the row above the prompt show it. Claude Code rotates that token when it refreshes it, which revokes the old copy; the plugin picks up the fresh one before each message and every minute. If no window is using that account, nothing refreshes it and it expires after a few hours: reopen Claude Code, or `/profile` to it again in a window that started on it. Switching back to the account the session started on clears the token, so its usage and email show again without a reopen.
 - **One login for all sessions:** every Claude Code window on this computer shares the live login. A switch moves new windows too, and an open window still on the old account may write its refreshed token back over the switch: reopen open windows after switching.
 - **Remote Control:** Claude Code disconnects it whenever the signed-in account changes and shows a notice. The plugin runs `/remote-control` to reconnect it under the new account, in every open window, whichever one did the switch (each window checks every 5 seconds), where that window had Remote Control: you ran `/remote-control` there, the Claude mobile app is attached, or, in the terminal, `remoteControlAtStartup` is on. The desktop app's and VS Code's own auto-connect toggles can't be read by a plugin, so after a switch run `/remote-control` there yourself once.
+- **The desktop app:** each of its sessions uses the app's own account, whatever the plugin sets, so `/profile <name>`, `/profile api` and switching when an account runs out work only in `claude` in a terminal. A desktop session shows the app's account in its row. A tested limit of Claude Code there, not something a plugin can change.
 - **Windows is untested:** macOS is tested in daily use and Linux by the test suite; Windows follows the same file layout as Linux but hasn't been run yet, and the status line isn't set up there automatically. Reports welcome.
 - **API credit:** while on it, claude.ai-only features (connectors, artifacts) are off, as in any API-key session. The key is in this session's environment as `ANTHROPIC_API_KEY`, as with `ANTHROPIC_API_KEY=… claude`. The plugin blanks it, and a switched account's token, out of every tool's output and every message the conversation keeps, so a command that prints the environment doesn't put it in the transcript; a command run there can still use it, so give the key a workspace spend limit. Switching to it approves the key for Claude Code the way its own prompt does (the key's last 20 characters under `customApiKeyResponses` in `~/.claude.json`).
 - **A goal that ends by itself:** a plugin can't see a goal being met or judged impossible, so until `/goal clear` or `/clear` a used-up plan still switches without asking.
