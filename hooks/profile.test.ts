@@ -665,6 +665,18 @@ test("another window's reading of the account shows here within seconds, with no
   expect(files['/home/u/.claude/profile-statusline/sess-1.live.txt']!.replace(/\x1b\[\d+m/g, '')).toContain('40%')
 })
 
+test('updating from before 0.4.6 keeps the bar: the reading it stored shows, and a reload keeps the engine\'s', async ($, on) => {
+  const { files, store, rateLimits } = stage(on)
+  store['limits:main'] = [{ kind: 'five_hour', percentUsed: 30 }] // what 0.4.5 kept
+  await $.session.start({ source: 'startup', cwd: '/p' } as any)
+  const row = () => files['/home/u/.claude/profile-status.txt']!.replace(/\x1b\[\d+m/g, '')
+  expect(row()).toBe('● main me@x │ 5h ▰▰▰▱▱▱▱▱▱▱ 30%\n')
+  rateLimits.push({ kind: 'five_hour', percentUsed: 33 }) // the engine's so far, which no measure repeats till it moves a point
+  await $.session.start({ source: 'startup', cwd: '/p' } as any) // a reload
+  expect(row()).toBe('● main me@x │ 5h ▰▰▰▱▱▱▱▱▱▱ 33%\n')
+  expect(files['/home/u/.claude/profile-usage/main.json']).toBe('[{"kind":"five_hour","percentUsed":33}]')
+})
+
 test('the band above the prompt shows the account and its usage', async ($, on) => {
   const { clock, files, context } = stage(on)
   on('ui.render', { component: 'AbovePrompt' }, () => ({ type: 'Text', props: {}, children: ['engine'] })) // Claude Code's own band

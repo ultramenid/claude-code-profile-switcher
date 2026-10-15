@@ -35,7 +35,8 @@ const usageFile = async ($: EngineInterface, name: string) => `${await home($)}/
 const keep = async ($: EngineInterface, name: string, list: Limit[] | null) => $.fs.write(await usageFile($, name), JSON.stringify(list))
 
 async function limits($: EngineInterface, name: string): Promise<Limit[] | undefined> {
-  const l = await $.fs.read(await usageFile($, name)).then(JSON.parse).catch(() => undefined)
+  // No file yet: the reading a version before 0.4.6 kept in $.store; a mid-write file reads as none.
+  const l = await $.fs.read(await usageFile($, name)).then(JSON.parse, () => $.store.get(`limits:${name}`)).catch(() => undefined)
   if (!Array.isArray(l)) return undefined
   const now = await $.clock.now()
   // A window past its reset has started over, though no response has said so yet.
@@ -1068,6 +1069,9 @@ export const register: Register = on => {
     await claimStatusLine($).catch(() => undefined)
     // A file per session: drop the ones nothing has written for a week.
     if ((await platform($).catch(() => 'win')) !== 'win') void $.process.run(['find', `${h}/.claude/profile-statusline`, '-name', '*.txt', '-mtime', '+7', '-delete']).catch(() => undefined)
+    // The engine's reading so far (a reload keeps it), as session.measure keeps the next: it measures only once a window moves a point.
+    const { rateLimits } = await $.session.usage().catch(() => ({ rateLimits: [] }))
+    if (rateLimits.length && !(await using($))) await keep($, await active($), rateLimits).catch(() => undefined)
     await show($)
     return next(e)
   })
