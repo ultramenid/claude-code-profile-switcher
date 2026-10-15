@@ -49,6 +49,7 @@ async function limits($: EngineInterface, name: string): Promise<Limit[] | undef
 const USAGE_URL = 'https://api.anthropic.com/api/oauth/usage'
 let usageNext = 0 // the endpoint takes a few reads a minute: once a minute
 let usageBackoff = 0 // and none for five minutes after a 429, forced or not
+let usageError: string | undefined // why the last read failed, which /usage shows: a row standing still says nothing
 
 /** A fetch raced with a timer: a stalled endpoint would hold up the switch queue behind it. Undefined on failure. */
 const fetchSoon = ($: EngineInterface, url: string, init: HttpInit) =>
@@ -58,15 +59,19 @@ const fetchSoon = ($: EngineInterface, url: string, init: HttpInit) =>
 async function planUsage($: EngineInterface, force = false): Promise<Limit[] | undefined> {
   const now = await $.clock.now()
   if (now < usageBackoff || (!force && now < usageNext)) return undefined
-  const auth = await $.session.authorize().catch(() => null)
-  if (auth?.kind !== 'bearer') return undefined
+  // A switched session's own token, sent as is: whatever the engine makes of its credentials then, the read is that account's.
+  const held = (await using($)) ? await $.env.get('ANTHROPIC_AUTH_TOKEN') : undefined
+  const auth = held ? undefined : await $.session.authorize().catch(() => null)
+  if (!held && auth?.kind !== 'bearer') return void (usageError = 'no subscription login to read it with')
   usageNext = Math.max(usageNext, now + 60_000)
   try {
-    const name = await active($) // whose credential `auth` is: a switch while the read is in flight doesn't relabel it
-    const res = await fetchSoon($, USAGE_URL, { auth: auth.handle, headers: { 'anthropic-beta': 'oauth-2025-04-20' } })
-    if (!res) return undefined
+    const name = await active($) // whose credential it is: a switch while the read is in flight doesn't relabel it
+    const beta = { 'anthropic-beta': 'oauth-2025-04-20' }
+    const res = await fetchSoon($, USAGE_URL, held ? { headers: { ...beta, Authorization: `Bearer ${held}` } } : { auth: auth!.handle, headers: beta })
+    if (!res) return void (usageError = 'no answer within 10s')
     if (res.status === 429) usageBackoff = now + 300_000
-    if (!res.ok) return undefined
+    if (!res.ok) return void (usageError = `HTTP ${res.status}${res.status === 429 ? ', tried again in 5 minutes' : ''}`)
+    usageError = undefined
     const body = JSON.parse(res.text)
     const list: Limit[] = Object.keys(WINDOWS).flatMap(kind => {
       const w = body?.[kind]
@@ -78,7 +83,7 @@ async function planUsage($: EngineInterface, force = false): Promise<Limit[] | u
     await $.store.set(`extra:${name}`, x?.is_enabled === true && (x.monthly_limit == null || !(x.used_credits >= x.monthly_limit)))
     return list
   } catch {
-    return undefined
+    return void (usageError = 'an answer that wasn\'t usage figures')
   }
 }
 
@@ -97,6 +102,7 @@ async function usagePanel($: EngineInterface, name: string): Promise<string> {
     ...(list?.length
       ? list.map(l => `${(WINDOWS[l.kind] ?? l.kind).padEnd(3)} ${bar(l.percentUsed)} ${Math.round(l.percentUsed)}%${when(l.resetsAt)}`)
       : ['No reading yet: send a message first.']),
+    ...(usageError ? [`Last read failed: ${usageError}`] : []),
     '',
     'From the plan\'s usage figures, read at most once a minute (this session switched with /profile). Reopen Claude Code for the full /usage.',
   ].join('\n')

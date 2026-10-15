@@ -44,6 +44,7 @@ function stage(on: any, answers: string[] = []) {
   on('store.delete', (_$: any, e: any) => (delete store[e.key], { value: undefined }))
   const session = {
     id: 'sess-1',
+    isAuthorizeBroken: false, // the engine handing out no credential
     isKeychainBroken: false,
     isDeleteBroken: false,
     isHexForNonAscii: false, // `security -w` prints a password holding a non-ASCII byte as hex
@@ -63,6 +64,7 @@ function stage(on: any, answers: string[] = []) {
   on('session.id', () => ({ value: session.id }))
   // Claude Code's order: ANTHROPIC_AUTH_TOKEN, then an approved ANTHROPIC_API_KEY, then the login.
   on('session.authorize', () => {
+    if (session.isAuthorizeBroken) return { value: null }
     const approved: string[] = JSON.parse(files['/home/u/.claude.json']!).customApiKeyResponses?.approved ?? []
     const isKey = !env.ANTHROPIC_AUTH_TOKEN && !!env.ANTHROPIC_API_KEY && approved.includes(env.ANTHROPIC_API_KEY.slice(-20))
     return { value: { handle: isKey ? 'key' : env.ANTHROPIC_AUTH_TOKEN ?? 't-main', kind: isKey ? 'api-key' : 'bearer' } }
@@ -77,15 +79,16 @@ function stage(on: any, answers: string[] = []) {
       return { value: tok ? { status: 200, ok: true, headers: {}, text: JSON.stringify({ access_token: tok, refresh_token: `r-${tok}`, expires_in: 28_800 }) }
         : { status: 400, ok: false, headers: {}, text: '{"error":"invalid_grant"}' } }
     }
-    const hold = session.holds[e.init?.auth]
+    const cred = e.init?.auth ?? e.init?.headers?.Authorization?.replace(/^Bearer /, '') // the engine's handle, or a token the plugin sends itself
+    const hold = session.holds[cred]
     if (hold) {
-      delete session.holds[e.init?.auth]
+      delete session.holds[cred]
       hold.reached()
       await hold.shut
     }
-    const status = session.usageStatus[e.init?.auth]
+    const status = session.usageStatus[cred]
     if (status) return { value: { status, ok: false, headers: {}, text: '' } }
-    const body = e.url === 'https://api.anthropic.com/api/oauth/usage' ? plan[e.init?.auth] : undefined
+    const body = e.url === 'https://api.anthropic.com/api/oauth/usage' ? plan[cred] : undefined
     return { value: body ? { status: 200, ok: true, headers: {}, text: JSON.stringify(body) } : { status: 401, ok: false, headers: {}, text: '' } }
   })
   on('ui.open', (_$: any, e: any) => (panes.add(e.id), { value: { isPlaced: true } }))
@@ -338,6 +341,22 @@ test('plan usage is kept per account; a switched one reads its own from the plan
   const usage = await $.command.run({ command: 'usage', args: '', origin: { kind: 'plugin', name: 'profile' }, presentation: { isFullscreen: false, columns: 80 } } as any)
   expect(usage.text).toContain('Plan usage · work (w@x)')
   expect(usage.text).toContain('5h  ▰▰▱▱▱▱▱▱▱▱▱▱▱▱▱▱▱▱▱▱ 9%\n7d  ▰▰▰▱▱▱▱▱▱▱▱▱▱▱▱▱▱▱▱▱ 13%')
+})
+
+test('a switched session reads its plan with its own token, whatever the engine resolves; /usage says why a read failed', async ($, on) => {
+  const { signIn, clock, plan, files, session } = stage(on)
+  session.isAuthorizeBroken = true
+  await run($, 'add work')
+  signIn('t-work', 'w@x')
+  await clock.advance(3000)
+  plan['t-work'] = { five_hour: { utilization: 5 } }
+  await run($, 'work')
+  expect(files['/home/u/.claude/profile-usage/work.json']).toBe('[{"kind":"five_hour","percentUsed":5}]')
+  const usage = () => $.command.run({ command: 'usage', args: '', origin: { kind: 'plugin', name: 'profile' }, presentation: { isFullscreen: false, columns: 80 } } as any)
+  expect((await usage()).text).not.toContain('Last read failed')
+  session.usageStatus['t-work'] = 429
+  await clock.advance(61_000)
+  expect((await usage()).text).toContain('5h  ▰▱▱▱▱▱▱▱▱▱▱▱▱▱▱▱▱▱▱▱ 5%\nLast read failed: HTTP 429, tried again in 5 minutes')
 })
 
 test('a request refused for a used-up plan goes again on another account: asked first, by itself during a /goal', async ($, on) => {
