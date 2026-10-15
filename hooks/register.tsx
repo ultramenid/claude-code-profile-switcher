@@ -1,4 +1,4 @@
-import type { EngineInterface, Register } from 'claude-code'
+import type { EngineInterface, HttpInit, Register } from 'claude-code'
 
 // Swaps Claude Code's own /login. The live login is the credential Claude Code
 // stores (macOS: Keychain entry "Claude Code-credentials"; Linux and Windows:
@@ -44,6 +44,10 @@ const USAGE_URL = 'https://api.anthropic.com/api/oauth/usage'
 let usageNext = 0 // the endpoint takes a few reads a minute: once a minute
 let usageBackoff = 0 // and none for five minutes after a 429, forced or not
 
+/** A fetch raced with a timer: a stalled endpoint would hold up the switch queue behind it. Undefined on failure. */
+const fetchSoon = ($: EngineInterface, url: string, init: HttpInit) =>
+  Promise.race([$.http.fetch(url, init).catch(() => undefined), $.clock.sleep(10_000).then(() => undefined)])
+
 /** The live credential's windows from the usage endpoint, kept as its account's reading; undefined off a subscription or on failure. */
 async function planUsage($: EngineInterface, force = false): Promise<Limit[] | undefined> {
   const now = await $.clock.now()
@@ -53,11 +57,7 @@ async function planUsage($: EngineInterface, force = false): Promise<Limit[] | u
   usageNext = Math.max(usageNext, now + 60_000)
   try {
     const name = await active($) // whose credential `auth` is: a switch while the read is in flight doesn't relabel it
-    // Raced with a timer: a stalled endpoint would hold up the switch queue behind it.
-    const res = await Promise.race([
-      $.http.fetch(USAGE_URL, { auth: auth.handle, headers: { 'anthropic-beta': 'oauth-2025-04-20' } }).catch(() => undefined),
-      $.clock.sleep(10_000).then(() => undefined),
-    ])
+    const res = await fetchSoon($, USAGE_URL, { auth: auth.handle, headers: { 'anthropic-beta': 'oauth-2025-04-20' } })
     if (!res) return undefined
     if (res.status === 429) usageBackoff = now + 300_000
     if (!res.ok) return undefined
@@ -304,6 +304,40 @@ async function save($: EngineInterface, name: string) {
   await writeSlot($, name, JSON.stringify(own(live)))
 }
 
+// Claude Code's own token endpoint and client: a session sent a token through ANTHROPIC_AUTH_TOKEN never renews it.
+const TOKEN_URL = 'https://platform.claude.com/v1/oauth/token'
+const CLIENT_ID = '9d1c250a-e61b-44d9-88ed-5944d1962f5e'
+
+/**
+ * `name`'s login, its access token renewed when due and written back where it came from; undefined
+ * when due but it can't be (no refresh token, refused). A saved copy is due 5 minutes ahead, as Claude
+ * Code renews its own; the live login only once expired, since windows sending it renew it first.
+ */
+async function renew($: EngineInterface, name: string, login: Login): Promise<Login | undefined> {
+  const now = await $.clock.now()
+  if (expiry(login.creds) > now + 300_000) return login
+  if (expiry(login.creds) > now && name === (await current($))) return login
+  const old = JSON.parse(login.creds).claudeAiOauth ?? {}
+  if (!old.refreshToken) return undefined
+  const res = await fetchSoon($, TOKEN_URL, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ grant_type: 'refresh_token', refresh_token: old.refreshToken, client_id: CLIENT_ID, ...(old.scopes?.length ? { scope: old.scopes.join(' ') } : {}) }),
+  })
+  if (!res?.ok) return undefined
+  const body = JSON.parse(res.text)
+  if (typeof body.access_token !== 'string' || typeof body.expires_in !== 'number') return undefined
+  const claudeAiOauth = { ...old, accessToken: body.access_token, refreshToken: body.refresh_token ?? old.refreshToken, expiresAt: now + body.expires_in * 1000 }
+  // ponytail: no lock shared with Claude Code's own refresh: a window renewing the live login at this moment spends the
+  // same refresh token, and the server rotates them, so one copy stops working (/profile remove + add). Take its lock if that bites.
+  // Back wherever the old copy still is, both mid-switch (saved, not loaded yet): no copy keeps a spent refresh token.
+  const live = await readLive($)
+  if (accessToken(live) === old.accessToken) await writeLive($, JSON.stringify({ ...JSON.parse(live!), claudeAiOauth }))
+  const saved = await slot($, name)
+  if (saved && accessToken(saved.creds) === old.accessToken) await writeSlot($, name, JSON.stringify({ ...saved, creds: JSON.stringify({ claudeAiOauth }) }))
+  return { ...login, creds: JSON.stringify({ ...JSON.parse(login.creds), claudeAiOauth }) }
+}
+
 /**
  * Claude Code drops Remote Control when the signed-in account changes; reconnect it
  * under the new one when this session had it: /remote-control ran here, a phone is
@@ -341,21 +375,27 @@ async function watchLogin($: EngineInterface) {
     if (id !== seen) await reconnectRemote($)
   })())
   $.clock.every(60_000, () => {
-    void show($).catch(() => undefined) // what other windows stored meanwhile, and the reset countdowns
-    void syncToken($).catch(() => undefined)
+    void (async () => {
+      await syncToken($).catch(() => undefined) // first: the plan below is read with a token renewed here
+      const name = await using($)
+      if (name && name !== API) await planUsage($) // a switched session's reading: no response brings it while idle or mid-turn
+      await show($) // what other windows stored meanwhile, and the reset countdowns
+    })().catch(() => undefined)
     void backFromApi($).catch(() => undefined)
   })
 }
 
 /**
  * A switched session holds a copy of the access token, and refreshing it (any window
- * does, near expiry) revokes that copy: take the fresh one from the live login or slot.
+ * does, near expiry) revokes that copy: take the fresh one from the live login or slot,
+ * renewing it here once due, since nothing renews a token sent as ANTHROPIC_AUTH_TOKEN.
  */
 async function syncToken($: EngineInterface) {
   const held = await $.env.get('ANTHROPIC_AUTH_TOKEN')
   const name = await using($)
   if (!held || !name || name === API) return
-  const tok = accessToken((await loginOf($, name))?.creds)
+  const login = await loginOf($, name)
+  const tok = accessToken((login && (await renew($, name, login)))?.creds)
   // A switch meanwhile set (or dropped) its own token: never put this one back over it.
   if (tok && tok !== held && (await $.env.get('ANTHROPIC_AUTH_TOKEN')) === held && (await using($)) === name) await $.env.set('ANTHROPIC_AUTH_TOKEN', tok)
 }
@@ -465,7 +505,9 @@ async function writeStatus($: EngineInterface) {
   const top = await Promise.all([$.session.model(), $.session.usage(), $.store.get(`cache:${sid}`)])
     .then(([model, u, cache]) => sessionLine(model, compacted?.sid === sid ? { window: u.context.window, tokens: compacted.tokens } : u.context, cache as Cache | undefined))
     .catch(() => undefined)
-  await $.fs.write(`${h}/.claude/profile-statusline/${sid}.txt`, `${top ? `${top}\n` : ''}${row(true)}\n`)
+  const path = `${h}/.claude/profile-statusline/${sid}`
+  await $.fs.write(`${path}.txt`, `${top ? `${top}\n` : ''}${row(false)}\n`) // what the script before 0.4.4 prints: another window may have written that one
+  await $.fs.write(`${path}.live.txt`, `${top ? `${top}\n` : ''}${row(true)}\n`)
 }
 
 /** `950`, `216.3k`, `1.0M` */
@@ -508,7 +550,9 @@ field() { printf '%s' "$in" | sed -n "s/.*\\"$1\\"[[:space:]]*:[[:space:]]*$2.*/
 id=$(field session_id '"\\([^"]*\\)"')
 effort=$(field effort '{[[:space:]]*"level"[[:space:]]*:[[:space:]]*"\\([a-z0-9]*\\)"')
 [ -n "$effort" ] && effort=$(printf '\\033[90m | \\033[0m\\033[35mEffort: %s\\033[0m' "$effort")
-f="$HOME/.claude/profile-statusline/$id.txt"
+f="$HOME/.claude/profile-statusline/$id"
+# .live.txt has countdowns worked out below; a plugin before 0.4.5 (another window's, say) writes .txt alone
+if [ -f "$f.live.txt" ] && [ ! "$f.txt" -nt "$f.live.txt" ]; then f="$f.live.txt"; else f="$f.txt"; fi
 # @EFFORT@ from the input above; @R<epoch seconds>@ as the time till then: 45m, 2h 5m, 3d 4h
 fill() {
   awk -v now="$(date +%s)" -v effort="$effort" '{
@@ -682,30 +726,30 @@ async function switchTo($: EngineInterface, name: string): Promise<string> {
   const wasApi = await onApi($)
   if (name === (await active($))) return `✓ Already on ${name}`
   const cur = await current($)
-  const login = name === cur ? await liveLogin($) : await slot($, name)
-  if (!login) return `! ${name} isn't signed in · /profile add ${name}`
+  const saved = name === cur ? await liveLogin($) : await slot($, name)
+  if (!saved) return `! ${name} isn't signed in · /profile add ${name}`
   const busy = name !== cur && (await adding($)) // in any window: its sign-in would be saved as this switch's account
   if (busy) return `! The sign-in for ${busy.name} isn't finished · switch once it is`
+  // Back on the login this process loaded: drop the token, so its own usage and email return; Claude Code renews that one itself.
+  const isStart = name === (await startedOn($))
+  // A saved copy nothing used for hours has expired: renewed before it's loaded and sent, never handed over dead.
+  const login = isStart ? saved : await renew($, name, saved)
+  if (!login) return `! ${name}'s saved login has expired and couldn't be renewed · /profile remove ${name}, then /profile add ${name}`
   if (name !== cur) {
     await save($, cur)
     await load($, name, login)
     await reconnectRemote($)
   }
   if (wasApi) await leaveApi($)
-  // Back on the login this process loaded: drop the token, so its own usage and email return.
-  const isStart = name === (await startedOn($))
   await $.env.set('ANTHROPIC_AUTH_TOKEN', isStart ? undefined : accessToken(login.creds))
   await $.env.set('CLAUDE_PROFILE_USING', isStart ? undefined : name)
   await show($) // the new name now: the usage read below can take seconds
   await planUsage($, true)
   await show($)
   const email = login.oauthAccount?.emailAddress
-  const isExpired = !isStart && expiry(login.creds) <= (await $.clock.now())
   return [
     `✓ Switched to ${name}${email ? ` (${email})` : ''}`,
-    isExpired
-      ? `Its saved login has expired, as no window used it for hours: reopen Claude Code to renew it; this session can't use it till then.`
-      : `This session uses it from your next message, and its plan usage shows here after that; reopen Claude Code for /usage, email and connectors.`,
+    `This session uses it from your next message, and its plan usage shows here after that; reopen Claude Code for /usage, email and connectors.`,
   ].join('\n')
 }
 
@@ -828,7 +872,7 @@ async function backFromApi($: EngineInterface) {
 const isOut = (list: Limit[] | undefined, now: number, hasExtra: unknown) =>
   !hasExtra && !!list?.some(l => l.percentUsed >= 100 && (!l.resetsAt || Date.parse(l.resetsAt) > now))
 
-/** The first signed-in account, in list order, with usage left and a token this session can use. */
+/** The first signed-in account, in list order, with usage left and a token this session can use; `expired`: skipped, their saved login dead. */
 async function spare($: EngineInterface, now: number, skip?: string): Promise<{ to?: string; expired: string[] }> {
   const live = await current($)
   const start = await startedOn($)
@@ -836,10 +880,11 @@ async function spare($: EngineInterface, now: number, skip?: string): Promise<{ 
   for (const name of await names($)) {
     if (name === skip || name === API || isOut(await limits($, name), now, await $.store.get(`extra:${name}`))) continue
     const login = name === live ? await liveLogin($) : await slot($, name)
-    // A saved login nothing refreshed for hours holds an expired token: this session can't use it.
-    // The one it loaded can: switching back drops the token, and Claude Code refreshes its own.
-    if (login && name !== start && expiry(login.creds) <= now) expired.push(name)
-    else if (login) return { to: name, expired }
+    if (!login) continue
+    // A saved copy nothing used for hours has expired: renewed here, else this session can't use it.
+    // The one it loaded needn't be: switching back drops the token, and Claude Code renews its own.
+    if (name === start || (await renew($, name, login))) return { to: name, expired }
+    expired.push(name)
   }
   return { expired }
 }
@@ -893,16 +938,16 @@ async function failover($: EngineInterface): Promise<boolean> {
   await $.store.set(`limits:${from}`, rateLimits!.map(l => ({ ...l, resetsAt: l.resetsAt ?? new Date(now + span(l.kind)).toISOString() })))
   const { to, expired } = await spare($, now, from)
   const key = await apiKey($)
-  const renew = expired.length ? ` · ${expired.join(', ')}: saved login expired, /profile to it and reopen Claude Code to renew it` : ''
+  const dead = expired.length ? ` · ${expired.join(', ')}: couldn't renew the saved login, /profile remove and /profile add it again` : ''
   if (!to && !key) {
-    $.ui.toast(expired.length ? `${from} is out of usage${renew}` : `${from} is out of usage, and so is every other account`, { timeoutMs: 8000 })
+    $.ui.toast(expired.length ? `${from} is out of usage${dead}` : `${from} is out of usage, and so is every other account`, { timeoutMs: 8000 })
     return false
   }
   // A goal takes the next account, API credit only after the last; asked, either is offered.
   let choice = to ?? API
   if (!isGoal) {
     const credit = `Console key …${key?.slice(-4)}, billed per token`
-    const question = !to ? `${from} ${expired.length ? `is out of usage, and ${expired.join(', ')} needs a reopen to renew its saved login` : 'and every other account are out of usage'}. Continue on API credit (${credit})?`
+    const question = !to ? `${from} ${expired.length ? `is out of usage, and ${expired.join(', ')}'s saved login couldn't be renewed` : 'and every other account are out of usage'}. Continue on API credit (${credit})?`
       : key ? `${from} is out of usage. Continue on ${to}, or on API credit (${credit})?`
       : `${from} is out of usage. Switch to ${to} and continue?`
     const options = [...(to ? [`Switch to ${to}`] : []), ...(key ? ['Use API credit'] : []), `Stay on ${from}`]
@@ -920,7 +965,7 @@ async function failover($: EngineInterface): Promise<boolean> {
     return false
   }
   if (isGoal) {
-    $.ui.toast(choice !== API ? `${from} is out of usage · switched to ${choice} to keep the goal going` : `${expired.length ? `${from} is out of usage` : 'Every account is out of usage'} · on API credit to keep the goal going${renew}`, { timeoutMs: 8000 })
+    $.ui.toast(choice !== API ? `${from} is out of usage · switched to ${choice} to keep the goal going` : `${expired.length ? `${from} is out of usage` : 'Every account is out of usage'} · on API credit to keep the goal going${dead}`, { timeoutMs: 8000 })
   }
   return true
 }

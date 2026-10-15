@@ -58,6 +58,7 @@ function stage(on: any, answers: string[] = []) {
     failWrite: new Set<string>(), // paths whose next fs.write is refused
     usageStatus: {} as Record<string, number>, // a credential the usage endpoint answers with this status
     holds: {} as Record<string, { reached: () => void; shut: Promise<void> }>, // usage reads held till opened
+    renewals: {} as Record<string, string>, // the token endpoint: a refresh token it takes once, and the access token it hands back
   }
   on('session.id', () => ({ value: session.id }))
   // Claude Code's order: ANTHROPIC_AUTH_TOKEN, then an approved ANTHROPIC_API_KEY, then the login.
@@ -69,6 +70,13 @@ function stage(on: any, answers: string[] = []) {
   // The plan's usage endpoint, answering for the credential the session sends.
   const plan: Record<string, Record<string, { utilization: number; resets_at?: string }>> = {}
   on('http.fetch', async (_$: any, e: any) => {
+    if (e.url === 'https://platform.claude.com/v1/oauth/token') { // refresh tokens rotate: each renews once, any other is refused
+      const sent = JSON.parse(e.init.body)
+      const tok = sent.grant_type === 'refresh_token' && sent.client_id && !e.init.auth ? session.renewals[sent.refresh_token] : undefined
+      delete session.renewals[sent.refresh_token]
+      return { value: tok ? { status: 200, ok: true, headers: {}, text: JSON.stringify({ access_token: tok, refresh_token: `r-${tok}`, expires_in: 28_800 }) }
+        : { status: 400, ok: false, headers: {}, text: '{"error":"invalid_grant"}' } }
+    }
     const hold = session.holds[e.init?.auth]
     if (hold) {
       delete session.holds[e.init?.auth]
@@ -333,12 +341,12 @@ test('plan usage is kept per account; a switched one reads its own from the plan
 })
 
 test('a request refused for a used-up plan goes again on another account: asked first, by itself during a /goal', async ($, on) => {
-  const { env, signIn, clock, rateLimits, keychain, toasts, files, holdUsage } = stage(on, ['Switch to work'])
+  const { env, signIn, clock, rateLimits, keychain, toasts, files, holdUsage, session, tokens } = stage(on, ['Switch to work'])
   const sent: (string | undefined)[] = []
   on('command.run', { command: 'goal' }, () => ({ text: '' }))
   on('turn.step', async function* (_$: any, e: any) { // the API: main, the login the session started on, is used up
     sent.push(env.ANTHROPIC_AUTH_TOKEN)
-    const isOut = env.ANTHROPIC_AUTH_TOKEN !== 't-work'
+    const isOut = !env.ANTHROPIC_AUTH_TOKEN?.startsWith('t-work')
     rateLimits.splice(0, 9, { kind: 'five_hour', percentUsed: isOut ? 100 : 3 })
     return { turnId: e.turnId, index: e.index, answer: isOut ? '' : 'ok', toolUses: [], stopReason: isOut ? null : 'end_turn', usage: null }
   })
@@ -375,10 +383,18 @@ test('a request refused for a used-up plan goes again on another account: asked 
 
   await run($, 'main')
   const work = JSON.parse(keychain['cc-swap-login|work']!)
-  keychain['cc-swap-login|work'] = JSON.stringify({ ...work, creds: JSON.stringify({ claudeAiOauth: { accessToken: 't-work', expiresAt: 1 } }) })
-  expect((await step()).stopReason).toBeNull() // nothing refreshed work's saved token: no use switching to it
+  // Hours on main: nothing used work's saved copy, so its access token has expired.
+  const idle = (refreshToken: string) => JSON.stringify({ ...work, creds: JSON.stringify({ claudeAiOauth: { accessToken: 't-work', refreshToken, expiresAt: clock.now() - 3_600_000 } }) })
+  keychain['cc-swap-login|work'] = idle('r-spent') // a refresh token the endpoint refuses
+  expect((await step()).stopReason).toBeNull() // no use switching to it
   expect(env.ANTHROPIC_AUTH_TOKEN).toBeUndefined()
-  expect(toasts.at(-1)).toContain('work: saved login expired')
+  expect(toasts.at(-1)).toContain("work: couldn't renew the saved login")
+  keychain['cc-swap-login|work'] = idle('r-work')
+  session.renewals['r-work'] = 't-work-3'
+  expect((await step()).answer).toBe('ok') // renewed, then switched to
+  expect(env.ANTHROPIC_AUTH_TOKEN).toBe('t-work-3')
+  expect(tokens().work).toBe('t-work-3') // its saved copy too: no copy keeps the spent refresh token
+  expect(toasts.at(-1)).toBe('main is out of usage · switched to work to keep the goal going')
 })
 
 test('API credit comes after every account: pasted in a box, offered when asked, by itself during a /goal, back once a plan resets', async ($, on) => {
@@ -655,8 +671,10 @@ test('the band above the prompt shows the account and its usage', async ($, on) 
   await $.turn.complete({ reason: 'answer', answer: 'ok', durationMs: 1000, isAborted: false, turnId: 't1', usage: { input_tokens: 1000, output_tokens: 500, cache_read_input_tokens: 98_500, cache_creation_input_tokens: 0, model: 'claude-opus-5-5' } } as any)
   await measure()
   expect(plain('/home/u/.claude/profile-statusline/sess-1.txt')).toBe(
-    'Model: Opus 5.5@EFFORT@ | Ctx: 216.3k | Cache: 99% | Context: ▰▰▱▱▱▱▱▱▱▱ 216.3k/1.0M (22%)\n● main me@x │ 5h ▰▰▰▰▰▰▱▱▱▱ 62% ↻ @R7500@\n') // the script counts down to it
-  expect(files['/home/u/.claude/profile-statusline.sh']).toContain('profile-statusline/$id.txt')
+    'Model: Opus 5.5@EFFORT@ | Ctx: 216.3k | Cache: 99% | Context: ▰▰▱▱▱▱▱▱▱▱ 216.3k/1.0M (22%)\n● main me@x │ 5h ▰▰▰▰▰▰▱▱▱▱ 62% ↻ 2h 5m\n')
+  // the script since 0.4.4 counts down to it; the .txt above is for one from before, which another window may have written
+  expect(plain('/home/u/.claude/profile-statusline/sess-1.live.txt')).toContain('62% ↻ @R7500@\n')
+  expect(files['/home/u/.claude/profile-statusline.sh']).toContain('profile-statusline/$id')
   for (const surface of ['terminal', 'desktop'] as const) {
     const ui = await $.ui.mount({
       plugin: 'profile', surface, component: 'AbovePrompt',
@@ -760,6 +778,47 @@ test('a switched session follows token refreshes, so its copy is never the revok
   expect(env.ANTHROPIC_AUTH_TOKEN).toBe('t-work-2')
   await run($, 'main') // back on the startup login: no copy to keep
   expect(env.ANTHROPIC_AUTH_TOKEN).toBeUndefined()
+})
+
+test("a saved copy nothing used for hours is renewed on a switch, never handed over dead; one that can't be is refused", async ($, on) => {
+  const s = stage(on)
+  await start($)
+  await added($, s, 'work', 't-work', 'w@x')
+  const work = JSON.parse(s.keychain['cc-swap-login|work']!)
+  const idle = (refreshToken: string) => JSON.stringify({ ...work, creds: JSON.stringify({ claudeAiOauth: {
+    accessToken: 't-work', refreshToken, expiresAt: s.clock.now() - 8 * 3_600_000, scopes: ['user:inference'] } }) })
+  s.keychain['cc-swap-login|work'] = idle('r-spent')
+  const was = JSON.stringify(s.keychain)
+  expect(await run($, 'work')).toBe("! work's saved login has expired and couldn't be renewed · /profile remove work, then /profile add work")
+  expect(JSON.stringify(s.keychain)).toBe(was) // nothing changed
+  expect(s.env.ANTHROPIC_AUTH_TOKEN).toBeUndefined()
+
+  s.keychain['cc-swap-login|work'] = idle('r-work')
+  s.session.renewals['r-work'] = 't-work-2'
+  expect(await run($, 'work')).toContain('✓ Switched to work (w@x)')
+  expect([s.env.ANTHROPIC_AUTH_TOKEN, s.liveToken(), s.tokens().work]).toEqual(['t-work-2', 't-work-2', 't-work-2'])
+  const saved = JSON.parse(JSON.parse(s.keychain['cc-swap-login|work']!).creds).claudeAiOauth
+  expect(saved).toEqual({ accessToken: 't-work-2', refreshToken: 'r-t-work-2', expiresAt: s.clock.now() + 28_800_000, scopes: ['user:inference'] })
+})
+
+test('a switched session renews the token it holds once it expires, and reads its plan usage every minute, idle or mid-turn', async ($, on) => {
+  const s = stage(on)
+  await start($)
+  const t0 = s.clock.now() // the minute's timer counts from here
+  await added($, s, 'work', 't-work', 'w@x')
+  await run($, 'work')
+  // Work's token runs out in 90s, and no window sends it to renew it ahead.
+  s.keychain[LIVE] = JSON.stringify({ claudeAiOauth: { accessToken: 't-work', refreshToken: 'r-t-work', expiresAt: t0 + 90_000 }, mcpOAuth: { linear: 'm1' } })
+  s.session.renewals['r-t-work'] = 't-work-2'
+  s.plan['t-work-2'] = { five_hour: { utilization: 42 } }
+  await s.clock.set(t0 + 60_000) // due, not expired: windows sending the live login renew it first
+  expect(s.env.ANTHROPIC_AUTH_TOKEN).toBe('t-work')
+  await s.clock.set(t0 + 120_000) // expired, and none did
+  expect(s.env.ANTHROPIC_AUTH_TOKEN).toBe('t-work-2')
+  expect(JSON.parse(s.keychain[LIVE]!)).toMatchObject({ claudeAiOauth: { accessToken: 't-work-2' }, mcpOAuth: { linear: 'm1' } }) // MCP sign-ins stay
+  expect(s.tokens().work).toBe('t-work-2') // the saved copy held the same token: renewed too
+  // No response since the switch: the minute's timer read the plan, with the renewed token.
+  expect(s.files['/home/u/.claude/profile-status.txt']!.replace(/\x1b\[\d+m/g, '')).toBe('● work w@x │ 5h ▰▰▰▰▱▱▱▱▱▱ 42%\n')
 })
 
 test('bare /profile picks from a dialog, falls back to the list', async ($, on) => {
@@ -1042,7 +1101,7 @@ test("plan readings land on the right account: one in flight during a switch kee
   expect(s.asked).toEqual(['work is out of usage. Switch to main and continue?'])
 })
 
-test('goals and API credit: a goal the model sets runs unattended, an expired login is named, clearing the goal stops the billing it took by itself', async ($, on) => {
+test("goals and API credit: a goal the model sets runs unattended, an expired login that can't be renewed is named, clearing the goal stops the billing it took by itself", async ($, on) => {
   const s = stage(on) // nobody answers: a question is dismissed
   on('tool.call', { tool: 'ProposeGoal' }, (_$: any, e: any) => ({ result: { condition: e.condition, askUser: false } }))
   on('command.run', { command: 'goal' }, () => ({ text: '' }))
@@ -1050,21 +1109,22 @@ test('goals and API credit: a goal the model sets runs unattended, an expired lo
   await start($)
   await added($, s, 'work', 't-work', 'w@x')
   const work = JSON.parse(s.keychain['cc-swap-login|work']!)
-  s.keychain['cc-swap-login|work'] = JSON.stringify({ ...work, creds: JSON.stringify({ claudeAiOauth: { accessToken: 't-work', expiresAt: 1 } }) })
+  // Expired hours ago, and its refresh token spent elsewhere: the endpoint refuses it.
+  s.keychain['cc-swap-login|work'] = JSON.stringify({ ...work, creds: JSON.stringify({ claudeAiOauth: { accessToken: 't-work', refreshToken: 'r-spent', expiresAt: s.clock.now() - 3_600_000 } }) })
   s.keychain['cc-swap-login|api'] = JSON.stringify({ apiKey: CONSOLE_KEY })
 
   await $.tool.call({ tool: 'ProposeGoal', condition: 'all tests pass', ask_user: false } as any)
   expect((await step($)).answer).toBe('ok')
   expect(sent).toEqual(['main', 'key'])
   expect(s.asked).toEqual([])
-  expect(s.toasts.at(-1)).toContain('work: saved login expired')
+  expect(s.toasts.at(-1)).toContain("work: couldn't renew the saved login")
 
   await command($, 'goal', 'clear')
   expect(s.env.ANTHROPIC_API_KEY).toBeUndefined()
   sent.length = 0
   expect((await step($)).answer).toBe('') // asked, and dismissed: not billed
   expect(sent).toEqual(['main'])
-  expect(s.asked[0]).toContain('work needs a reopen to renew its saved login')
+  expect(s.asked[0]).toContain("work's saved login couldn't be renewed")
 })
 
 test('steps running out together ask once, even when the answer is to stay', async ($, on) => {
