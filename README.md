@@ -41,7 +41,7 @@ When a request is refused because the account's plan is used up (its 5-hour or 7
 
 An account with extra usage turned on isn't out at 100%: it counts as out only once its extra usage is off or at its monthly limit (from the plan's usage figures, what `/usage` reads). Subagents that run out together switch once, with one question; the rest wait and go again on the new account.
 
-Accounts are tried in `/profile list` order. It skips one whose last reading has a used-up window that hasn't reset yet, A saved login that expired because no window used it for hours is renewed first; one that can't be is skipped (a notice names it: `/profile remove` and `/profile add` it again). The switch is a `/profile <name>`, with the same effects on other windows.
+Accounts are tried in `/profile list` order. It skips one whose last reading has a used-up window that hasn't reset yet. A saved login that expired because no window used it for hours is renewed first; one that can't be is skipped (a notice names it: `/profile remove` and `/profile add` it again). The switch is a `/profile <name>`, with the same effects on other windows.
 
 **API credit comes last**, and only if you've set it up with `/profile add api`: it's billed per token to your Console key, so a goal moves to it only once every account is out (when you're asked, you can pick it sooner). It applies to this session alone; other windows keep the live login. Once an account's window resets, the session goes back to it by itself (a notice says so). API credit you choose yourself stays until you `/profile <name>`: a `/profile api`, or picking it while an account still had usage.
 
@@ -60,7 +60,7 @@ If you also have the `api-fallback` plugin, turn its auto mode off (`/api auto o
 - **Model, Effort:** the session's model and its effort level, which follows `/effort` within seconds.
 - **Ctx, Context:** how much of the context window the conversation fills.
 - **Cache:** the share of the conversation's input tokens read from the prompt cache, counted from the first message the plugin saw.
-- **5h, 7d:** the account's plan usage per window and the time until it resets (`↻`). Both come with each response, so they update together; after a `/profile` switch, the session reads them from the plan's usage figures instead (what `/usage` reads), when it switches and at most once a minute after. 7d shows only on an account that has a weekly limit.
+- **5h, 7d:** the account's plan usage per window and the time until it resets (`↻`). Both come with each response, so they update together, and every window on that account shows the latest reading within seconds; after a `/profile` switch, the session reads them from the plan's usage figures instead (what `/usage` reads), when it switches and once a minute after. 7d shows only on an account that has a weekly limit.
 - Numbers turn yellow and then red as a window or the context fills, and as the cache hit rate drops.
 - On a narrow terminal the row above the prompt drops the email, then the reset countdowns, then Cache, then the 7d bar, so it stays on one line.
 

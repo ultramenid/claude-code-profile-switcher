@@ -10,7 +10,7 @@
     {
       "name": "profile",
       "description": "Switch Claude Code's login between accounts: /profile add <name> saves a full login, /profile <name> makes it the live one.",
-      "version": "0.4.5",
+      "version": "0.4.6",
       "source": "./",
       "category": "productivity"
     }

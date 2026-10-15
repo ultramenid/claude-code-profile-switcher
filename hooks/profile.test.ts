@@ -652,6 +652,19 @@ test('a weekly bar shows only on an account with a weekly limit; a window past i
   expect(row()).toBe('● main me@x │ 5h ▱▱▱▱▱▱▱▱▱▱ 0%\n')
 })
 
+test("another window's reading of the account shows here within seconds, with no response of this window's", async ($, on) => {
+  const { files, clock } = stage(on)
+  await $.session.start({ source: 'startup', cwd: '/p' } as any)
+  await $.session.measure({ context: {} as any, rateLimits: [{ kind: 'five_hour', percentUsed: 5 }], changed: ['rateLimits'] })
+  expect(files['/home/u/.claude/profile-usage/main.json']).toBe('[{"kind":"five_hour","percentUsed":5}]') // where every window reads it
+  files['/home/u/.claude/profile-usage/main.json'] = '[{"kind":"five_hour","percentUsed":40}]' // another window's response
+  await clock.advance(5000)
+  expect(files['/home/u/.claude/profile-statusline/sess-1.live.txt']!.replace(/\x1b\[\d+m/g, '')).toContain('● main me@x │ 5h ▰▰▰▰▱▱▱▱▱▱ 40%\n')
+  files['/home/u/.claude/profile-usage/main.json'] = '[{"kind":"five_' // caught mid-write: the last row stands
+  await clock.advance(5000)
+  expect(files['/home/u/.claude/profile-statusline/sess-1.live.txt']!.replace(/\x1b\[\d+m/g, '')).toContain('40%')
+})
+
 test('the band above the prompt shows the account and its usage', async ($, on) => {
   const { clock, files, context } = stage(on)
   on('ui.render', { component: 'AbovePrompt' }, () => ({ type: 'Text', props: {}, children: ['engine'] })) // Claude Code's own band

@@ -29,8 +29,13 @@ type Row = { name: string; email?: string; usage?: string; isActive: boolean; is
 const WINDOWS: Record<string, string> = { five_hour: '5h', seven_day: '7d' }
 type Limit = { kind: string; percentUsed: number; resetsAt?: string }
 
+// Each account's reading in a file every window checks every few seconds: kept in $.store, another
+// window's reading reached this one's status line at its minute's redraw at best.
+const usageFile = async ($: EngineInterface, name: string) => `${await home($)}/.claude/profile-usage/${name}.json`
+const keep = async ($: EngineInterface, name: string, list: Limit[] | null) => $.fs.write(await usageFile($, name), JSON.stringify(list))
+
 async function limits($: EngineInterface, name: string): Promise<Limit[] | undefined> {
-  const l = await $.store.get(`limits:${name}`)
+  const l = await $.fs.read(await usageFile($, name)).then(JSON.parse).catch(() => undefined)
   if (!Array.isArray(l)) return undefined
   const now = await $.clock.now()
   // A window past its reset has started over, though no response has said so yet.
@@ -66,7 +71,7 @@ async function planUsage($: EngineInterface, force = false): Promise<Limit[] | u
       const w = body?.[kind]
       return typeof w?.utilization === 'number' ? [{ kind, percentUsed: Math.round(w.utilization * 10) / 10, ...(w.resets_at ? { resetsAt: w.resets_at } : {}) }] : []
     })
-    if (list.length) await $.store.set(`limits:${name}`, list)
+    if (list.length) await keep($, name, list)
     // Extra usage keeps an account going past its windows, till its monthly limit (null: none).
     const x = body?.extra_usage
     await $.store.set(`extra:${name}`, x?.is_enabled === true && (x.monthly_limit == null || !(x.used_credits >= x.monthly_limit)))
@@ -374,6 +379,15 @@ async function watchLogin($: EngineInterface) {
     }
     if (id !== seen) await reconnectRemote($)
   })())
+  // Another window's reading of this account, on the status line within seconds rather than at the next minute.
+  $.clock.every(5000, () => void (async () => {
+    if (!band || band.name === API) return
+    const l = await limits($, band.name)
+    if (!l || JSON.stringify(l) === JSON.stringify(band.limits)) return // unreadable (mid-write), or nothing new
+    band = { ...band, limits: l }
+    await writeStatus($)
+    $.ui.invalidate('ui.render')
+  })().catch(() => undefined))
   $.clock.every(60_000, () => {
     void (async () => {
       await syncToken($).catch(() => undefined) // first: the plan below is read with a token renewed here
@@ -935,7 +949,7 @@ async function failover($: EngineInterface): Promise<boolean> {
   if (!isOut(rateLimits, now, await $.store.get(`extra:${from}`))) return false // failed for another reason
   // So no fallback picks it till it resets; a window that doesn't say when has reset by its full length.
   const span = (kind: string) => (kind === 'seven_day' ? 7 * 24 : 5) * 3_600_000
-  await $.store.set(`limits:${from}`, rateLimits!.map(l => ({ ...l, resetsAt: l.resetsAt ?? new Date(now + span(l.kind)).toISOString() })))
+  await keep($, from, rateLimits!.map(l => ({ ...l, resetsAt: l.resetsAt ?? new Date(now + span(l.kind)).toISOString() })))
   const { to, expired } = await spare($, now, from)
   const key = await apiKey($)
   const dead = expired.length ? ` · ${expired.join(', ')}: couldn't renew the saved login, /profile remove and /profile add it again` : ''
@@ -977,7 +991,7 @@ async function remove($: EngineInterface, name: string): Promise<string> {
   if (!isAdding && ((await current($)) === name || (await active($)) === name)) return `! ${name} is the active login · switch away first`
   if (!(await deleteSlot($, name))) return `! Couldn't remove ${name}'s saved login · nothing changed`
   pending.delete(name)
-  await $.store.delete(`limits:${name}`) // a new account added under the name starts without them
+  await keep($, name, null) // a new account added under the name starts without them
   await $.store.delete(`extra:${name}`)
   if (isAdding) { // its sign-in watch stops, and the browser sign-in with it
     if (add.pid && (await loginRunning($, add.pid))) await $.process.run(['kill', add.pid]).catch(() => undefined)
@@ -1066,7 +1080,7 @@ export const register: Register = on => {
       await planUsage($) // a switched token: the engine's reading may be the login it started with
       await show($)
     } else if (e.changed.includes('rateLimits') && e.rateLimits.length) {
-      await $.store.set(`limits:${await active($)}`, e.rateLimits) // the login this process loaded, whatever another window made live
+      await keep($, await active($), e.rateLimits) // the login this process loaded, whatever another window made live
       await show($)
     } else await writeStatus($) // context or cost
     return r
