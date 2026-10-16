@@ -60,6 +60,7 @@ function stage(on: any, answers: string[] = []) {
     usageStatus: {} as Record<string, number>, // a credential the usage endpoint answers with this status
     holds: {} as Record<string, { reached: () => void; shut: Promise<void> }>, // usage reads held till opened
     renewals: {} as Record<string, string>, // the token endpoint: a refresh token it takes once, and the access token it hands back
+    isLockHeld: false, // another process holds Claude Code's refresh lock
   }
   on('session.id', () => ({ value: session.id }))
   // Claude Code's order: ANTHROPIC_AUTH_TOKEN, then an approved ANTHROPIC_API_KEY, then the login.
@@ -115,6 +116,7 @@ function stage(on: any, answers: string[] = []) {
       if (session.dumpDelayMs) await clock.sleep(session.dumpDelayMs)
       return out(Object.keys(keychain).filter(k => k.startsWith('cc-swap-login|')).map(k => `    "acct"<blob>="${k.split('|')[1]}"`).join('\n'))
     }
+    if (a[0] === 'sh' && a[4] === '/home/u/.claude/.oauth_refresh.lock') return out('', session.isLockHeld ? 1 : 0)
     if (a[0] !== 'security') return out('')
     if (a[1] === '-i') {
       if (session.isKeychainBroken) return out('', 1)
@@ -160,7 +162,7 @@ function stage(on: any, answers: string[] = []) {
   return { keychain, env, argvs, signIn, liveEmail, liveToken, tokens, clock, files, remote, surfaces, rateLimits, panes, plan, context, session, toasts, asked, model, holdUsage, store }
 }
 
-test('add captures a full login and puts the current one back; switching swaps the live login', async ($, on) => {
+test('add captures a full login and puts the current one back; switching moves this session alone', async ($, on) => {
   const { keychain, env, argvs, signIn, liveEmail, clock } = stage(on)
 
   expect(await run($, 'add work')).toContain('✓ Sign-in for work opened')
@@ -176,17 +178,13 @@ test('add captures a full login and puts the current one back; switching swaps t
     'Accounts\n● main  me@x · active\n○ work  w@x\n\n/profile <name> switch · /profile add <name> · /profile remove <name>',
   )
 
-  expect(await run($, 'work')).toContain('✓ Switched to work (w@x)')
-  expect(keychain['Claude Code-credentials|me']).toBe(creds('t-work'))
-  expect(liveEmail()).toBe('w@x')
+  expect(await run($, 'work')).toBe('✓ Switched to work (w@x)\nOnly this session moves, from your next message: other windows keep theirs, and a new one opens on main.')
+  expect(keychain['Claude Code-credentials|me']).toBe(creds('t-main')) // the shared login stays main's
+  expect(liveEmail()).toBe('me@x')
   expect(env.ANTHROPIC_AUTH_TOKEN).toBe('t-work')
 
-  // a refresh while on work is kept when switching away
-  keychain['Claude Code-credentials|me'] = creds('t-work2')
   expect(await run($, 'main')).toContain('✓ Switched to main (me@x)')
-  expect(env.ANTHROPIC_AUTH_TOKEN).toBe('t-main') // this test's session never started: no startedOn
-  expect(keychain['Claude Code-credentials|me']).toBe(creds('t-main'))
-  expect(JSON.parse(keychain['cc-swap-login|work']!).creds).toBe(creds('t-work2'))
+  expect(env.ANTHROPIC_AUTH_TOKEN).toBeUndefined() // the shared login: Claude Code sends its own
 
   expect(await run($, 'main')).toBe('✓ Already on main')
   expect(await run($, 'remove main')).toContain('switch away first')
@@ -209,7 +207,7 @@ test('/profile alone: Add account… asks subscription or API credit, then runs 
   expect(asked.at(-1)).toBe('Name for the new account?')
 })
 
-test('switching back to the login the session started on drops the token', async ($, on) => {
+test('switching back to the shared login drops the token', async ($, on) => {
   const { env, signIn, clock } = stage(on)
   await $.session.start({ source: 'startup', cwd: '/p' } as any)
   await run($, 'add work')
@@ -221,33 +219,21 @@ test('switching back to the login the session started on drops the token', async
   expect(env.ANTHROPIC_AUTH_TOKEN).toBeUndefined()
 })
 
-test('a switch never loses a login: unreadable config or a failed Keychain write changes nothing; MCP sign-ins stay live', async ($, on) => {
-  const { keychain, files, signIn, clock, session } = stage(on)
+test('a switch writes no login: the shared one, its MCP sign-ins, ~/.claude.json and the saved accounts stay as they were', async ($, on) => {
+  const { keychain, files, env, signIn, clock } = stage(on)
   await run($, 'add work')
   signIn('t-work', 'w@x')
   await clock.advance(3000)
-  const LIVE = 'Claude Code-credentials|me'
   keychain[LIVE] = JSON.stringify({ ...JSON.parse(creds('t-main')), mcpOAuth: { linear: 'm1' } })
+  const was = JSON.stringify([keychain, files[CONFIG]])
   expect(await run($, 'work')).toContain('✓ Switched to work')
-  expect(JSON.parse(keychain[LIVE]!)).toEqual({ ...JSON.parse(creds('t-work')), mcpOAuth: { linear: 'm1' } }) // the login swapped, not the MCP sign-ins
-  expect(JSON.parse(keychain['cc-swap-login|main']!).creds).toBe(creds('t-main'))
-
-  const before = () => [keychain[LIVE], files['/home/u/.claude.json'], keychain['cc-swap-login|main'], keychain['cc-swap-login|work']].join('\n')
-  const was = before()
-  const config = files['/home/u/.claude.json']!
-  files['/home/u/.claude.json'] = config.slice(0, 20) // half-written by another window
-  expect(await run($, 'main')).toMatch(/^! /)
-  files['/home/u/.claude.json'] = config
-  expect(before()).toBe(was)
-  session.isKeychainBroken = true // locked, or a write security refuses
-  expect(await run($, 'main')).toContain('The Keychain write failed')
-  expect(before()).toBe(was)
-  session.isKeychainBroken = false
+  expect(env.ANTHROPIC_AUTH_TOKEN).toBe('t-work')
   expect(await run($, 'main')).toContain('✓ Switched to main')
+  expect(JSON.stringify([keychain, files[CONFIG]])).toBe(was)
 })
 
 test('per process: a /clear keeps the switch, and another window making a login live does not relabel this session', async ($, on) => {
-  const { keychain, files, env, signIn, clock, session } = stage(on)
+  const { keychain, env, signIn, clock, session } = stage(on)
   await $.session.start({ source: 'startup', cwd: '/p' } as any)
   await run($, 'add work')
   signIn('t-work', 'w@x')
@@ -255,14 +241,26 @@ test('per process: a /clear keeps the switch, and another window making a login 
   await run($, 'work')
   session.id = 'sess-2' // /clear: a new session id, no session.start
   expect(await run($, 'work')).toBe('✓ Already on work')
-  keychain['Claude Code-credentials|me'] = creds('t-work-2') // another window refreshed work
+  const work = JSON.parse(keychain['cc-swap-login|work']!)
+  keychain['cc-swap-login|work'] = JSON.stringify({ ...work, creds: creds('t-work-2') }) // another window on work renewed it
   await clock.advance(60_000)
   expect(env.ANTHROPIC_AUTH_TOKEN).toBe('t-work-2') // still followed
-  signIn('t-main', 'me@x') // another window made main live
+  signIn('t-home', 'h@x') // another window's /login made another account the shared login
   expect(await run($, 'list')).toContain('● work  w@x · active') // this session still sends work's token
   expect(await run($, 'main')).toContain('✓ Switched to main')
-  expect(env.ANTHROPIC_AUTH_TOKEN).toBeUndefined() // main is the login this process loaded
-  expect(JSON.parse(files['/home/u/.claude.json']!).oauthAccount.emailAddress).toBe('me@x')
+  expect(env.ANTHROPIC_AUTH_TOKEN).toBe('t-main') // main isn't the shared login now: this session holds its token
+})
+
+test("a window not switched shows the shared login, whichever it is now; /profile to its old one then holds that one's token", async ($, on) => {
+  const s = stage(on)
+  await start($)
+  await added($, s, 'work', 't-work', 'w@x')
+  s.env.CLAUDE_PROFILE_STARTED_ON = 'main' // set by a version before 0.5.0
+  await start($) // the plugin reloaded: the process environment stays
+  s.signIn('t-work', 'w@x') // a window still on 0.4 switched the shared login to work
+  expect(await run($, 'list')).toContain('● work  w@x · active') // what this window sends now
+  expect(await run($, 'main')).toContain('✓ Switched to main') // not "Already on main"
+  expect([s.env.ANTHROPIC_AUTH_TOKEN, s.liveToken()]).toEqual(['t-main', 't-work'])
 })
 
 const MARK = '/home/u/.claude/profile-adding.json'
@@ -752,7 +750,7 @@ test('the band above the prompt shows the account and its usage', async ($, on) 
   expect(plain('/home/u/.claude/profile-statusline/sess-1.txt')).toContain('Ctx: 12.0k')
 })
 
-test('reconnects Remote Control after a switch when it is on at startup', async ($, on) => {
+test('reconnects Remote Control once an add puts the login back, when it is on at startup; a switch leaves it be', async ($, on) => {
   const { files, remote, signIn, clock } = stage(on)
   files['/home/u/.claude/settings.json'] = '{"remoteControlAtStartup":true}'
   await run($, 'add work')
@@ -761,21 +759,19 @@ test('reconnects Remote Control after a switch when it is on at startup', async 
   expect(remote.length).toBe(1) // after add put main back
   await run($, 'work')
   await clock.advance(500)
-  expect(remote.length).toBe(2) // after add put main back, and after the switch
+  expect(remote.length).toBe(1) // the shared login, Remote Control's, didn't change
 })
 
 test('reconnects Remote Control for a phone attached, not for the desktop app', async ($, on) => {
   const { remote, signIn, clock, surfaces } = stage(on)
-  await run($, 'add work')
-  signIn('t-work', 'w@x')
-  await clock.advance(3500)
+  await start($)
   surfaces.splice(0, 1, 'desktop')
-  await run($, 'work')
-  await clock.advance(500)
+  signIn('t-work', 'w@x') // another window's /login
+  await clock.advance(5500)
   expect(remote.length).toBe(0)
   surfaces.push('mobile')
-  await run($, 'main')
-  await clock.advance(500)
+  signIn('t-main', 'me@x')
+  await clock.advance(5500)
   expect(remote.length).toBe(1)
 })
 
@@ -783,16 +779,14 @@ test('in the desktop app, reconnects only a session that turned Remote Control o
   const { files, remote, signIn, clock, surfaces } = stage(on)
   files['/home/u/.claude/settings.json'] = '{"remoteControlAtStartup":true}' // the terminal's auto-connect
   surfaces.splice(0, 1, 'desktop')
-  await run($, 'add work')
-  signIn('t-work', 'w@x')
-  await clock.advance(3500)
-  await run($, 'work')
-  await clock.advance(500)
+  await start($)
+  signIn('t-work', 'w@x') // another window's /login
+  await clock.advance(5500)
   expect(remote.length).toBe(0)
   await $.command.run({ command: 'remote-control', args: '', origin: { kind: 'composer' }, presentation: { isFullscreen: false, columns: 80 } } as any)
   expect(remote.length).toBe(1) // the person turned it on
-  await run($, 'main')
-  await clock.advance(500)
+  signIn('t-main', 'me@x')
+  await clock.advance(5500)
   expect(remote.length).toBe(2)
 })
 
@@ -817,10 +811,11 @@ test('a switched session follows token refreshes, so its copy is never the revok
   await clock.advance(3500)
   await run($, 'work')
   expect(env.ANTHROPIC_AUTH_TOKEN).toBe('t-work')
-  keychain['Claude Code-credentials|me'] = creds('t-work-2') // another window refreshed work
+  const work = JSON.parse(keychain['cc-swap-login|work']!)
+  keychain['cc-swap-login|work'] = JSON.stringify({ ...work, creds: creds('t-work-2') }) // another window on work renewed it
   await clock.advance(60_000)
   expect(env.ANTHROPIC_AUTH_TOKEN).toBe('t-work-2')
-  await run($, 'main') // back on the startup login: no copy to keep
+  await run($, 'main') // back on the shared login: no copy to keep
   expect(env.ANTHROPIC_AUTH_TOKEN).toBeUndefined()
 })
 
@@ -840,7 +835,7 @@ test("a saved copy nothing used for hours is renewed on a switch, never handed o
   s.keychain['cc-swap-login|work'] = idle('r-work')
   s.session.renewals['r-work'] = 't-work-2'
   expect(await run($, 'work')).toContain('✓ Switched to work (w@x)')
-  expect([s.env.ANTHROPIC_AUTH_TOKEN, s.liveToken(), s.tokens().work]).toEqual(['t-work-2', 't-work-2', 't-work-2'])
+  expect([s.env.ANTHROPIC_AUTH_TOKEN, s.liveToken(), s.tokens().work]).toEqual(['t-work-2', 't-main', 't-work-2'])
   const saved = JSON.parse(JSON.parse(s.keychain['cc-swap-login|work']!).creds).claudeAiOauth
   expect(saved).toEqual({ accessToken: 't-work-2', refreshToken: 'r-t-work-2', expiresAt: s.clock.now() + 28_800_000, scopes: ['user:inference'] })
 })
@@ -851,8 +846,9 @@ test('a switched session renews the token it holds once it expires, and reads it
   const t0 = s.clock.now() // the minute's timer counts from here
   await added($, s, 'work', 't-work', 'w@x')
   await run($, 'work')
+  s.signIn('t-work', 'w@x') // another window's /login made work the shared login
   // Work's token runs out in 90s, and no window sends it to renew it ahead.
-  s.keychain[LIVE] = JSON.stringify({ claudeAiOauth: { accessToken: 't-work', refreshToken: 'r-t-work', expiresAt: t0 + 90_000 }, mcpOAuth: { linear: 'm1' } })
+  s.keychain[LIVE] =JSON.stringify({ claudeAiOauth: { accessToken: 't-work', refreshToken: 'r-t-work', expiresAt: t0 + 90_000 }, mcpOAuth: { linear: 'm1' } })
   s.session.renewals['r-t-work'] = 't-work-2'
   s.plan['t-work-2'] = { five_hour: { utilization: 42 } }
   await s.clock.set(t0 + 60_000) // due, not expired: windows sending the live login renew it first
@@ -863,6 +859,26 @@ test('a switched session renews the token it holds once it expires, and reads it
   expect(s.tokens().work).toBe('t-work-2') // the saved copy held the same token: renewed too
   // No response since the switch: the minute's timer read the plan, with the renewed token.
   expect(s.files['/home/u/.claude/profile-status.txt']!.replace(/\x1b\[\d+m/g, '')).toBe('● work w@x │ 5h ▰▰▰▰▱▱▱▱▱▱ 42%\n')
+})
+
+test("a renewal waits on Claude Code's refresh lock, and takes what its holder renewed instead of spending the refresh token again", async ($, on) => {
+  const s = stage(on)
+  await start($)
+  await added($, s, 'work', 't-work', 'w@x')
+  const work = JSON.parse(s.keychain['cc-swap-login|work']!)
+  const saved = (tok: string, expiresAt: number) => JSON.stringify({ ...work, creds: JSON.stringify({ claudeAiOauth: { accessToken: tok, refreshToken: `r-${tok}`, expiresAt } }) })
+  s.keychain['cc-swap-login|work'] = saved('t-work', s.clock.now() - 3_600_000) // expired
+  s.session.renewals['r-t-work'] = 't-work-2'
+  s.session.isLockHeld = true // another window renews work right now
+  const switching = run($, 'work')
+  await s.clock.advance(1000)
+  s.keychain['cc-swap-login|work'] = saved('t-work-9', s.clock.now() + 28_800_000) // what it renewed
+  s.session.isLockHeld = false
+  await s.clock.advance(1000)
+  expect(await switching).toContain('✓ Switched to work (w@x)')
+  expect(s.env.ANTHROPIC_AUTH_TOKEN).toBe('t-work-9')
+  expect(s.session.renewals['r-t-work']).toBe('t-work-2') // never sent: the server would have revoked the pair
+  expect(s.argvs).toContain('rmdir /home/u/.claude/.oauth_refresh.lock') // released
 })
 
 test('bare /profile picks from a dialog, falls back to the list', async ($, on) => {
@@ -924,13 +940,18 @@ test('on Linux the logins are files: ~/.claude/.credentials.json and ~/.claude/p
   expect(argvs.some(a => a.includes('umask 077'))).toBe(true)
 
   expect(await run($, 'work')).toContain('✓ Switched to work (w@x)')
-  expect(files['/home/u/.claude/.credentials.json']).toBe(creds('t-work'))
+  expect(files['/home/u/.claude/.credentials.json']).toBe(creds('t-main')) // the shared login stays
   expect(await run($, 'list')).toContain('● work  w@x · active')
   await run($, 'main')
-  isDiskFull = true // the write goes to a file moved into place: the old one stays whole
-  expect(await run($, 'work')).toMatch(/^! Writing \/home\/u\/.claude\/\S+ failed/)
-  expect(files['/home/u/.claude/.credentials.json']).toBe(creds('t-main'))
+  expect(await run($, 'add home')).toContain('✓ Sign-in for home opened')
+  isDiskFull = true // the write goes to a file moved into place: no half-written login is left
+  files['/home/u/.claude/.credentials.json'] = creds('t-home')
+  files['/home/u/.claude.json'] = JSON.stringify({ oauthAccount: { emailAddress: 'h@x' } })
+  await clock.advance(3000)
+  expect(files['/home/u/.claude/profile-logins/home.json']).toBeUndefined()
   isDiskFull = false
+  await clock.advance(3000) // tried again
+  expect(files['/home/u/.claude/profile-logins/home.json']).toContain('t-home')
   expect(await run($, 'remove work')).toBe('✓ Removed work')
   expect(files['/home/u/.claude/profile-logins/work.json']).toBeUndefined()
 })
@@ -1028,37 +1049,27 @@ test('a sign-in is saved only once it is whole: retried after a failed write, he
   expect(await run($, 'add fifth')).toContain('✓ Sign-in for fifth opened') // no 10-minute wait
 })
 
-test("a login is never saved under another account's name: a failed config write rolls back, another window's half-done switch is caught, an unreadable account stops an add, a pending add holds switches", async ($, on) => {
-  const s = stage(on, ['Switch to main'])
-  on('turn.step', async function* (_$: any, e: any) { // home is used up
-    return { turnId: e.turnId, index: e.index, answer: '', toolUses: [], stopReason: null, usage: null }
-  })
+test("a login is never saved under another account's name: a failed config write rolls back, another window's half-done switch is caught, an unreadable account stops an add", async ($, on) => {
+  const s = stage(on)
   await added($, s, 'work', 't-work', 'w@x')
-  await added($, s, 'home', 't-home', 'h@x')
 
-  s.session.failWrite.add(CONFIG)
-  expect(await run($, 'work')).toMatch(/^! /)
-  expect(s.liveToken()).toBe('t-main') // the Keychain went back
-  expect(await run($, 'work')).toContain('✓ Switched to work')
-  expect(s.tokens().main).toBe('t-main')
+  s.session.failWrite.add(CONFIG) // putting main back after the sign-in: its account doesn't land
+  expect(await run($, 'add home')).toContain('✓ Sign-in for home opened')
+  s.signIn('t-home', 'h@x')
+  await s.clock.advance(3000)
+  expect(s.liveToken()).toBe('t-home') // the Keychain went back: the next tick tries again
+  await s.clock.advance(3000)
+  expect([s.liveToken(), s.liveEmail(), s.tokens().main]).toEqual(['t-main', 'me@x', 't-main'])
 
-  expect(await run($, 'main')).toContain('✓ Switched to main')
-  s.keychain[LIVE] = creds('t-work') // another window's /profile work, between its two writes
-  expect(await run($, 'home')).toContain('✓ Switched to home')
-  expect(s.tokens().main).toBe('t-main')
+  s.keychain[LIVE] = creds('t-work') // a window still on 0.4 switching to work, between its two writes
+  expect(await run($, 'add personal')).toContain('✓ Sign-in for personal opened') // saves the live login as main's first
+  expect(s.tokens().main).toBe('t-main') // not work's token
+  expect(await run($, 'remove personal')).toBe('✓ Removed personal')
+  s.keychain[LIVE] = creds('t-main')
 
   s.session.unreadable.add(CONFIG) // over 4 MiB: nothing to save the live login by
   expect(await run($, 'add personal')).toMatch(/^! Can't read your account/)
-  expect(s.argvs.filter(a => a.includes('claude auth login'))).toHaveLength(2)
-  s.session.unreadable.delete(CONFIG)
-
-  expect(await run($, 'add personal')).toContain('✓ Sign-in for personal opened')
-  expect(await run($, 'work')).toMatch(/^! The sign-in for personal isn't finished/)
-  await s.clock.advance(3000)
-  expect(s.tokens().personal).toBeUndefined()
-  s.plan['t-home'] = { five_hour: { utilization: 100, resets_at: new Date(s.clock.now() + 3_600_000).toISOString() } }
-  await step($) // home runs out: the switch picked is refused, and a notice says why
-  expect(s.toasts.at(-1)).toContain("the switch didn't happen: The sign-in for personal isn't finished")
+  expect(s.argvs.filter(a => a.includes('claude auth login'))).toHaveLength(3)
 })
 
 test("data that can't be read doesn't break the plugin: a failed uname, a name printed as hex, a cut-off account, a Keychain listing that fails at startup", async ($, on) => {
@@ -1082,18 +1093,7 @@ test("data that can't be read doesn't break the plugin: a failed uname, a name p
   s.signIn('t-work', 'w@x') // this window starts on work, and its first Keychain listing fails
   s.session.dumpFailures = 1
   await start($)
-  expect(s.env.CLAUDE_PROFILE_STARTED_ON).toBe('work')
-})
-
-test('a half-written ~/.claude.json at startup still records the login this process loaded', async ($, on) => {
-  const s = stage(on)
-  s.keychain['cc-swap-login|main'] = JSON.stringify({ creds: creds('t-main'), oauthAccount: { emailAddress: 'me@x' } })
-  s.keychain['cc-swap-login|work'] = JSON.stringify({ creds: creds('t-work'), oauthAccount: { emailAddress: 'w@x' } })
-  s.session.tornReads = 2
-  await start($)
-  s.signIn('t-work', 'w@x') // later, another window makes work live
-  expect(s.env.CLAUDE_PROFILE_STARTED_ON).toBe('main')
-  expect(await run($, 'list')).toContain('● main  me@x · active')
+  expect(await run($, 'list')).toContain('● work  w@x · active')
 })
 
 test("remove: cancels a pending add from any window, says so when the delete fails, drops the name's old readings", async ($, on) => {
@@ -1223,13 +1223,14 @@ test('a token sync in flight never puts back a token a switch just dropped; a mo
   const t0 = s.clock.now() // the minute's timer counts from here
   await added($, s, 'work', 't-work', 'w@x')
   await run($, 'work')
-  s.keychain[LIVE] = creds('t-work-2') // another window refreshed work
+  const work = JSON.parse(s.keychain['cc-swap-login|work']!)
+  s.keychain['cc-swap-login|work'] = JSON.stringify({ ...work, creds: creds('t-work-2') }) // another window on work renewed it
   s.session.dumpDelayMs = 1000 // the Keychain is slow for a moment
   await s.clock.set(t0 + 60_000) // the minute's token sync starts, and waits on it
   s.session.dumpDelayMs = 0
   expect(await run($, 'main')).toContain('✓ Switched to main')
   await s.clock.advance(1000) // the slow read returns
-  expect(s.env.ANTHROPIC_AUTH_TOKEN).toBeUndefined() // still on main, the login this process loaded
+  expect(s.env.ANTHROPIC_AUTH_TOKEN).toBeUndefined() // still on main, the shared login
 
   const reconnects = s.remote.length
   s.session.unreadable.add(CONFIG) // caught mid-write
@@ -1274,15 +1275,16 @@ test('the status line follows the conversation: a compaction shows at once, /mod
   expect(s.store['cache:sess-1']).toBeUndefined()
 })
 
-test('the login this process loaded: a Keychain read that fails at startup is tried again, and /login here changes it', async ($, on) => {
+test('/login here moves the row with the shared login: a Keychain read that fails at startup breaks nothing, and /profile back then holds the old one', async ($, on) => {
   const s = stage(on)
   on('command.run', { command: 'login' }, () => (s.signIn('t-work', 'w@x'), { text: '' }))
   s.keychain['cc-swap-login|main'] = JSON.stringify({ creds: creds('t-main'), oauthAccount: { emailAddress: 'me@x' } })
   s.keychain['cc-swap-login|work'] = JSON.stringify({ creds: creds('t-work'), oauthAccount: { emailAddress: 'w@x' } })
-  s.session.readFailures = 1 // locked for a moment: not "logged out", which would pin a made-up name
+  s.session.readFailures = 1 // locked for a moment: not "logged out"
   await start($)
-  expect(s.env.CLAUDE_PROFILE_STARTED_ON).toBe('main')
+  expect(await run($, 'list')).toContain('● main  me@x · active')
   await command($, 'login')
-  expect(s.env.CLAUDE_PROFILE_STARTED_ON).toBe('work')
+  expect(s.files['/home/u/.claude/profile-status.txt']).toContain('work')
   expect(await run($, 'main')).toContain('✓ Switched to main') // not "Already on main"
+  expect(s.env.ANTHROPIC_AUTH_TOKEN).toBe('t-main')
 })

@@ -104,7 +104,7 @@ async function usagePanel($: EngineInterface, name: string): Promise<string> {
       : ['No reading yet: send a message first.']),
     ...(usageError ? [`Last read failed: ${usageError}`] : []),
     '',
-    'From the plan\'s usage figures, read at most once a minute (this session switched with /profile). Reopen Claude Code for the full /usage.',
+    'From the plan\'s usage figures, read at most once a minute (this session switched with /profile). Claude Code\'s own /usage is the shared login\'s: /profile back to it to see that one.',
   ].join('\n')
 }
 
@@ -321,33 +321,69 @@ const TOKEN_URL = 'https://platform.claude.com/v1/oauth/token'
 const CLIENT_ID = '9d1c250a-e61b-44d9-88ed-5944d1962f5e'
 
 /**
+ * Whether `name`'s login needs renewing before it's sent: a saved copy 5 minutes ahead, as Claude Code
+ * renews its own; the live login only once expired, since windows sending it renew it first.
+ */
+async function isDue($: EngineInterface, name: string, login: Login) {
+  const now = await $.clock.now()
+  const at = expiry(login.creds)
+  return at <= now + 300_000 && (at <= now || name !== (await current($)))
+}
+
+/**
+ * Runs `f` holding Claude Code's own refresh lock, the directory proper-lockfile takes (a minute
+ * untouched is a crashed holder's): no other window, nor Claude Code itself, spends the same refresh
+ * token meanwhile, and Claude Code, once it has the lock, reads back what `f` wrote. Undefined when
+ * it stays held 15 seconds.
+ */
+async function locked<T>($: EngineInterface, f: () => Promise<T>): Promise<T | undefined> {
+  const dir = `${await home($)}/.claude/.oauth_refresh.lock`
+  // ponytail: no stale-lock check on Windows; a crashed holder's lock there blocks renewals till it's deleted.
+  const isWin = (await platform($)) === 'win'
+  const take = isWin ? ['cmd', '/c', 'mkdir', dir.replace(/\//g, '\\')]
+    : ['sh', '-c', 'mkdir "$1" 2>/dev/null || { [ -n "$(find "$1" -maxdepth 0 -mmin +1)" ] && rmdir "$1" && mkdir "$1"; }', 'sh', dir]
+  for (let i = 0; i < 30; i++) {
+    if ((await $.process.run(take).catch(() => undefined))?.exitCode === 0) {
+      try {
+        return await f()
+      } finally {
+        await $.process.run(isWin ? ['cmd', '/c', 'rmdir', dir.replace(/\//g, '\\')] : ['rmdir', dir]).catch(() => undefined)
+      }
+    }
+    await $.clock.sleep(500)
+  }
+  return undefined
+}
+
+/**
  * `name`'s login, its access token renewed when due and written back where it came from; undefined
- * when due but it can't be (no refresh token, refused). A saved copy is due 5 minutes ahead, as Claude
- * Code renews its own; the live login only once expired, since windows sending it renew it first.
+ * when due but it can't be (no refresh token, refused, the lock held throughout).
  */
 async function renew($: EngineInterface, name: string, login: Login): Promise<Login | undefined> {
-  const now = await $.clock.now()
-  if (expiry(login.creds) > now + 300_000) return login
-  if (expiry(login.creds) > now && name === (await current($))) return login
-  const old = JSON.parse(login.creds).claudeAiOauth ?? {}
-  if (!old.refreshToken) return undefined
-  const res = await fetchSoon($, TOKEN_URL, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ grant_type: 'refresh_token', refresh_token: old.refreshToken, client_id: CLIENT_ID, ...(old.scopes?.length ? { scope: old.scopes.join(' ') } : {}) }),
+  if (!(await isDue($, name, login))) return login
+  return locked($, async () => {
+    // Again under the lock: whoever held it may have just renewed this one, and its refresh token is spent.
+    const cur = (await loginOf($, name)) ?? login
+    if (!(await isDue($, name, cur))) return cur
+    const old = JSON.parse(cur.creds).claudeAiOauth ?? {}
+    if (!old.refreshToken) return undefined
+    const now = await $.clock.now()
+    const res = await fetchSoon($, TOKEN_URL, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ grant_type: 'refresh_token', refresh_token: old.refreshToken, client_id: CLIENT_ID, ...(old.scopes?.length ? { scope: old.scopes.join(' ') } : {}) }),
+    })
+    if (!res?.ok) return undefined
+    const body = JSON.parse(res.text)
+    if (typeof body.access_token !== 'string' || typeof body.expires_in !== 'number') return undefined
+    const claudeAiOauth = { ...old, accessToken: body.access_token, refreshToken: body.refresh_token ?? old.refreshToken, expiresAt: now + body.expires_in * 1000 }
+    // Back wherever the old copy still is, the live login and the slot alike: no copy keeps a spent refresh token.
+    const live = await readLive($)
+    if (accessToken(live) === old.accessToken) await writeLive($, JSON.stringify({ ...JSON.parse(live!), claudeAiOauth }))
+    const saved = await slot($, name)
+    if (saved && accessToken(saved.creds) === old.accessToken) await writeSlot($, name, JSON.stringify({ ...saved, creds: JSON.stringify({ claudeAiOauth }) }))
+    return { ...cur, creds: JSON.stringify({ ...JSON.parse(cur.creds), claudeAiOauth }) }
   })
-  if (!res?.ok) return undefined
-  const body = JSON.parse(res.text)
-  if (typeof body.access_token !== 'string' || typeof body.expires_in !== 'number') return undefined
-  const claudeAiOauth = { ...old, accessToken: body.access_token, refreshToken: body.refresh_token ?? old.refreshToken, expiresAt: now + body.expires_in * 1000 }
-  // ponytail: no lock shared with Claude Code's own refresh: a window renewing the live login at this moment spends the
-  // same refresh token, and the server rotates them, so one copy stops working (/profile remove + add). Take its lock if that bites.
-  // Back wherever the old copy still is, both mid-switch (saved, not loaded yet): no copy keeps a spent refresh token.
-  const live = await readLive($)
-  if (accessToken(live) === old.accessToken) await writeLive($, JSON.stringify({ ...JSON.parse(live!), claudeAiOauth }))
-  const saved = await slot($, name)
-  if (saved && accessToken(saved.creds) === old.accessToken) await writeSlot($, name, JSON.stringify({ ...saved, creds: JSON.stringify({ claudeAiOauth }) }))
-  return { ...login, creds: JSON.stringify({ ...JSON.parse(login.creds), claudeAiOauth }) }
 }
 
 /**
@@ -746,31 +782,25 @@ async function switchTo($: EngineInterface, name: string): Promise<string> {
   if (await isDesktop($)) return DESKTOP
   const wasApi = await onApi($)
   if (name === (await active($))) return `✓ Already on ${name}`
+  // The shared login, every window's, stays as it is: a switch is this session's token alone.
   const cur = await current($)
   const saved = name === cur ? await liveLogin($) : await slot($, name)
   if (!saved) return `! ${name} isn't signed in · /profile add ${name}`
-  const busy = name !== cur && (await adding($)) // in any window: its sign-in would be saved as this switch's account
-  if (busy) return `! The sign-in for ${busy.name} isn't finished · switch once it is`
-  // Back on the login this process loaded: drop the token, so its own usage and email return; Claude Code renews that one itself.
-  const isStart = name === (await startedOn($))
-  // A saved copy nothing used for hours has expired: renewed before it's loaded and sent, never handed over dead.
-  const login = isStart ? saved : await renew($, name, saved)
+  // Back on the shared login: drop the token, so its own usage and email return; Claude Code renews that one itself.
+  const isShared = name === cur
+  // A saved copy nothing used for hours has expired: renewed before it's sent, never handed over dead.
+  const login = isShared ? saved : await renew($, name, saved)
   if (!login) return `! ${name}'s saved login has expired and couldn't be renewed · /profile remove ${name}, then /profile add ${name}`
-  if (name !== cur) {
-    await save($, cur)
-    await load($, name, login)
-    await reconnectRemote($)
-  }
   if (wasApi) await leaveApi($)
-  await $.env.set('ANTHROPIC_AUTH_TOKEN', isStart ? undefined : accessToken(login.creds))
-  await $.env.set('CLAUDE_PROFILE_USING', isStart ? undefined : name)
+  await $.env.set('ANTHROPIC_AUTH_TOKEN', isShared ? undefined : accessToken(login.creds))
+  await $.env.set('CLAUDE_PROFILE_USING', isShared ? undefined : name)
   await show($) // the new name now: the usage read below can take seconds
   await planUsage($, true)
   await show($)
   const email = login.oauthAccount?.emailAddress
   return [
     `✓ Switched to ${name}${email ? ` (${email})` : ''}`,
-    `This session uses it from your next message, and its plan usage shows here after that; reopen Claude Code for /usage, email and connectors.`,
+    `Only this session moves, from your next message: other windows keep theirs, and a new one opens on ${cur}.`,
   ].join('\n')
 }
 
@@ -779,7 +809,7 @@ async function switchTo($: EngineInterface, name: string): Promise<string> {
 // session sends it, so other windows keep the live login and its connectors.
 const KEY_PANE = 'profile-api-key'
 
-// What this process switched to, and the login it loaded, live in its environment like
+// What this process switched to, and a desktop session's own account, live in its environment like
 // the token they go with: a /clear (a new session id) keeps them, a resume (a new process) starts over.
 const using = ($: EngineInterface) => $.env.get('CLAUDE_PROFILE_USING')
 const startedOn = ($: EngineInterface) => $.env.get('CLAUDE_PROFILE_STARTED_ON')
@@ -803,7 +833,10 @@ async function desktopAccount($: EngineInterface): Promise<string> {
 /** Whether this session bills the `api` profile. */
 const onApi = async ($: EngineInterface) => (await using($)) === API
 
-/** Where this session's requests go: what it switched to, else the login it loaded (not what another window made live). */
+/**
+ * Where this session's requests go: what it switched to, else the shared login, which Claude Code reads
+ * again as its token nears expiry, whatever it loaded (a desktop session: the app's account).
+ */
 const active = async ($: EngineInterface) => (await using($)) ?? (await startedOn($)) ?? current($)
 
 async function apiKey($: EngineInterface): Promise<string | undefined> {
@@ -896,15 +929,14 @@ const isOut = (list: Limit[] | undefined, now: number, hasExtra: unknown) =>
 /** The first signed-in account, in list order, with usage left and a token this session can use; `expired`: skipped, their saved login dead. */
 async function spare($: EngineInterface, now: number, skip?: string): Promise<{ to?: string; expired: string[] }> {
   const live = await current($)
-  const start = await startedOn($)
   const expired: string[] = []
   for (const name of await names($)) {
     if (name === skip || name === API || isOut(await limits($, name), now, await $.store.get(`extra:${name}`))) continue
     const login = name === live ? await liveLogin($) : await slot($, name)
     if (!login) continue
     // A saved copy nothing used for hours has expired: renewed here, else this session can't use it.
-    // The one it loaded needn't be: switching back drops the token, and Claude Code renews its own.
-    if (name === start || (await renew($, name, login))) return { to: name, expired }
+    // The shared login needn't be: switching to it drops the token, and Claude Code renews its own.
+    if (name === live || (await renew($, name, login))) return { to: name, expired }
     expired.push(name)
   }
   return { expired }
@@ -1057,8 +1089,8 @@ export const register: Register = on => {
       pending.add(mine)
       watchSignIn($, mine)
     }
-    // The login this process loaded; a reload mid-switch (token set) keeps the first answer. A Keychain
-    // or ~/.claude.json caught mid-write gets a second try; failing that the live login stands in.
+    // A desktop session's own account. A terminal one sends the shared login when not switched: the
+    // login it started on, as versions before 0.5.0 kept it, is no label for it once that moves.
     if (await isDesktop($)) {
       await $.env.set('CLAUDE_PROFILE_STARTED_ON', await desktopAccount($))
       if (await using($)) { // switched by a version before 0.4.4, to no effect
@@ -1066,10 +1098,7 @@ export const register: Register = on => {
         await $.env.set('ANTHROPIC_AUTH_TOKEN', undefined)
         await leaveApi($)
       }
-    } else if (!(await $.env.get('ANTHROPIC_AUTH_TOKEN')) && !(await startedOn($))) {
-      const first = await current($).catch(() => current($)).catch(() => undefined)
-      if (first) await $.env.set('CLAUDE_PROFILE_STARTED_ON', first)
-    }
+    } else await $.env.set('CLAUDE_PROFILE_STARTED_ON', undefined)
     const h = await home($)
     await $.fs.write(`${h}/.claude/profile-statusline.sh`, STATUSLINE).catch(() => undefined)
     await claimStatusLine($).catch(() => undefined)
@@ -1077,7 +1106,7 @@ export const register: Register = on => {
     if ((await platform($).catch(() => 'win')) !== 'win') void $.process.run(['find', `${h}/.claude/profile-statusline`, '-name', '*.txt', '-mtime', '+7', '-delete']).catch(() => undefined)
     // The engine's reading so far (a reload keeps it), as session.measure keeps the next: it measures only once a window moves a point.
     const { rateLimits } = await $.session.usage().catch(() => ({ rateLimits: [] }))
-    if (rateLimits.length && !(await using($))) await keep($, await active($), rateLimits).catch(() => undefined)
+    if (rateLimits.length && !(await using($))) await active($).then(name => keep($, name, rateLimits)).catch(() => undefined)
     await show($)
     return next(e)
   })
@@ -1198,11 +1227,9 @@ export const register: Register = on => {
     return next(e)
   })
 
-  // /login here: this process now sends the new login, the one a switch back to drops the token for.
+  // /login here: the shared login is the new one, and so is this session's row.
   on('command.run', { command: 'login' }, async ($, e, next) => {
     const r = await next(e)
-    const now = await current($).catch(() => undefined)
-    if (now) await $.env.set('CLAUDE_PROFILE_STARTED_ON', now)
     await show($)
     return r
   })

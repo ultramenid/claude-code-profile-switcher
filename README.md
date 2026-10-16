@@ -1,6 +1,6 @@
 # claude-code-profile-switcher
 
-Switch Claude Code's login between accounts with `/profile`. Each account is a full login: after a switch, `claude` opens on that account with its plan usage, email and claude.ai connectors. The plugin also shows which account you're on and how much of its plan you've used, and when an account runs out it moves the session to the next one, then to your Console API credit once every account is out, so the work carries on.
+Switch Claude Code between accounts with `/profile`. A switch moves only the session you run it in: other open windows keep their account, so switching in one never logs another out. The plugin also shows which account you're on and how much of its plan you've used, and when an account runs out it moves the session to the next one, then to your Console API credit once every account is out, so the work carries on.
 
 ## Install
 
@@ -11,9 +11,7 @@ Switch Claude Code's login between accounts with `/profile`. Each account is a f
 Works in the terminal. In the Code tab of the Claude desktop app, the account row, `/profile list`, `add` and `remove` work too, but switching doesn't: the app signs each of its sessions in with its own account, and Claude Code there ignores any other login or API key. Switch the app's account in the app.
 
 > [!WARNING]
-> **Switch only with `/profile`.** Claude Code refreshes the live login every few hours, and the old refresh key stops working. The plugin saves the latest version when you switch away with `/profile`. If the login changes another way (you run `/login`, or another open Claude Code window writes its old login back), that account's saved copy may stop working, and switching to it leaves you logged out.
->
-> Fix: `/profile remove <name>`, then `/profile add <name>`, or `/login` while on it. Reopen other Claude Code windows after switching.
+> **Updating from 0.4:** run `/reload-plugins` in every open window. A window still on 0.4 rewrites the shared login when it switches, which moves the other windows and can spend a saved login's refresh key. A saved login already spent says so when you switch to it ("couldn't be renewed"): `/profile remove <name>`, then `/profile add <name>`, once.
 
 ## Commands
 
@@ -22,13 +20,13 @@ Works in the terminal. In the Code tab of the Claude desktop app, the account ro
 | `/profile` | Picker: switch to another signed-in account, or add one (a subscription account, as `/profile add <name>`, or API credit, as `/profile add api`) |
 | `/profile list` | All accounts with email and last plan usage (`5h 23% 7d 40%`), and `api` with its key's last four characters; `●` marks the one this session uses |
 | `/profile add <name>` | Opens a browser login for another account; a notice says when it's saved. Your current login stays live |
-| `/profile <name>` | Makes that account the login. This session uses it from your next message; reopen for its usage, email and connectors |
+| `/profile <name>` | Moves this session to that account from your next message. Other windows, and new ones, stay where they are |
 | `/profile remove <name>` | Forgets a saved account (not the live one, or the one this session uses), with its usage readings |
 | `/profile add api` | Sets up API credit: opens a box above the prompt; paste your Console API key (console.anthropic.com → API keys) and press Enter. The key goes to the plugin alone, never the prompt or its history |
 | `/profile api` | Bills this session to that key now; `/profile <name>` goes back |
 | `/usage` | On a switched session, the switched account's plan usage (5-hour and 7-day bars with reset times); otherwise Claude Code's own `/usage` |
 
-Your login when you first use the plugin is saved as `main`. One `/profile add` runs at a time across all windows, and switching waits till it's done. A plugin reload mid-add picks the sign-in back up; `/profile remove` on a pending account cancels it from any window; after 10 minutes the add gives up. Either way the browser sign-in stops with it. A sign-in as an account already saved, or as the one you're on, isn't saved again: the add ends there and says so. Tip: do the browser login for `/profile add` in a private window, so it doesn't reuse the claude.ai account you're already signed into.
+Your login when you first use the plugin is saved as `main`. One `/profile add` runs at a time across all windows. A plugin reload mid-add picks the sign-in back up; `/profile remove` on a pending account cancels it from any window; after 10 minutes the add gives up. Either way the browser sign-in stops with it. A sign-in as an account already saved, or as the one you're on, isn't saved again: the add ends there and says so. Tip: do the browser login for `/profile add` in a private window, so it doesn't reuse the claude.ai account you're already signed into.
 
 ## When an account runs out
 
@@ -41,7 +39,7 @@ When a request is refused because the account's plan is used up (its 5-hour or 7
 
 An account with extra usage turned on isn't out at 100%: it counts as out only once its extra usage is off or at its monthly limit (from the plan's usage figures, what `/usage` reads). Subagents that run out together switch once, with one question; the rest wait and go again on the new account.
 
-Accounts are tried in `/profile list` order. It skips one whose last reading has a used-up window that hasn't reset yet. A saved login that expired because no window used it for hours is renewed first; one that can't be is skipped (a notice names it: `/profile remove` and `/profile add` it again). The switch is a `/profile <name>`, with the same effects on other windows.
+Accounts are tried in `/profile list` order. It skips one whose last reading has a used-up window that hasn't reset yet. A saved login that expired because no window used it for hours is renewed first; one that can't be is skipped (a notice names it: `/profile remove` and `/profile add` it again). The switch is a `/profile <name>`: this session only.
 
 **API credit comes last**, and only if you've set it up with `/profile add api`: it's billed per token to your Console key, so a goal moves to it only once every account is out (when you're asked, you can pick it sooner). It applies to this session alone; other windows keep the live login. Once an account's window resets, the session goes back to it by itself (a notice says so). API credit you choose yourself stays until you `/profile <name>`: a `/profile api`, or picking it while an account still had usage.
 
@@ -90,7 +88,11 @@ Claude Code keeps its login, and the account details in `oauthAccount` in `~/.cl
 | Linux | `~/.claude/.credentials.json` | `~/.claude/profile-logins/<name>.json` (mode 600) |
 | Windows | `%USERPROFILE%\.claude\.credentials.json` | `%USERPROFILE%\.claude\profile-logins\<name>.json` |
 
-A switch saves the live login into the current account's copy (keeping any token refresh), then writes the target's copy into Claude Code's entry and `~/.claude.json`. Only the Claude login moves: MCP servers' sign-ins, kept in the same entry, stay as they are. A copy is never saved over another account's, a switch that can't read `~/.claude.json` or write the login stops before changing anything, and one that fails halfway puts the login back. On macOS, secrets go to `security` on stdin, never on the command line, which holds about 2 KB: a login past that (Claude Code's entry also keeps MCP servers' sign-ins) can't be switched, and the switch says so. On Linux each file is written whole and owner-only from its first byte. The account list and which one is live are read from those saved copies, so reinstalling the plugin loses nothing.
+A switch writes no login. It hands this session the account's access token as `ANTHROPIC_AUTH_TOKEN`, which Claude Code sends ahead of its own login; Claude Code's own login, the one every window shares, stays as it is. Switching back to that login's account clears the token.
+
+Claude Code never renews a token handed to it this way, so the plugin does: a saved login 5 minutes before it expires, when you switch to it, when a failover picks it, and once a minute in each window using it. Each refresh hands out a new refresh key and revokes the old one, so two windows renewing one login at the same moment would leave one of them logged out. The plugin renews under Claude Code's own refresh lock (`~/.claude/.oauth_refresh.lock`), as Claude Code does, and reads the login again once it holds it: if another window, or Claude Code, renewed it meanwhile, it takes that token instead of spending the refresh key again. The new token is written back wherever the old one was, and every window on that account picks it up before its next message and every minute.
+
+A copy is never saved over another account's. On macOS, secrets go to `security` on stdin, never on the command line, which holds about 2 KB: a login past that (Claude Code's entry also keeps MCP servers' sign-ins) can't be saved, and the plugin says so. On Linux each file is written whole and owner-only from its first byte. The account list and which one is live are read from those saved copies, so reinstalling the plugin loses nothing.
 
 The Console key is kept the same way, as the account `api`. Switching to it touches no login: it sets `ANTHROPIC_API_KEY` in this session and clears the switched token (`ANTHROPIC_AUTH_TOKEN`), which Claude Code would send ahead of the key, then checks that the key is what goes out.
 
@@ -98,13 +100,13 @@ The status line is a small script, `~/.claude/profile-statusline.sh`, that print
 
 ## Limitations
 
-- **This session after a switch:** it loaded its login at start, so until you reopen, requests use the new account's access token, while Claude Code's own `/status` and claude.ai connectors still use the account the session started on. Plan usage still works: the plugin reads the new account's 5-hour and 7-day usage from the plan's usage figures as it switches and once a minute after, idle or not, and `/usage`, `/profile list`, the status line and the row above the prompt show it. Claude Code rotates that token when it refreshes it, which revokes the old copy; the plugin picks up the fresh one before each message and every minute. If no window is using that account, nothing in Claude Code refreshes it, so the plugin renews it itself once it expires, and renews an expired saved login before switching to it. Switching back to the account the session started on clears the token, so its usage and email show again without a reopen.
-- **One login for all sessions:** every Claude Code window on this computer shares the live login. A switch moves new windows too, and an open window still on the old account may write its refreshed token back over the switch: reopen open windows after switching.
-- **Remote Control:** Claude Code disconnects it whenever the signed-in account changes and shows a notice. The plugin runs `/remote-control` to reconnect it under the new account, in every open window, whichever one did the switch (each window checks every 5 seconds), where that window had Remote Control: you ran `/remote-control` there, the Claude mobile app is attached, or, in the terminal, `remoteControlAtStartup` is on. The desktop app's and VS Code's own auto-connect toggles can't be read by a plugin, so after a switch run `/remote-control` there yourself once.
+- **A switched session:** requests use the switched account, while Claude Code's own `/status`, email and claude.ai connectors stay the shared login's. Plan usage still works: the plugin reads the account's 5-hour and 7-day usage from the plan's usage figures as it switches and once a minute after, idle or not, and `/usage`, `/profile list`, the status line and the row above the prompt show it.
+- **New windows open on the shared login:** Claude Code's own login, the one you last signed in with (`/login`), not the account you last switched to. A `/login` changes it for every window that isn't switched, and their rows follow.
+- **Remote Control** runs under the shared login, so a switch leaves it connected. Claude Code disconnects it when the shared login changes (a `/login`, or the moment `/profile add` signs in) and shows a notice. The plugin then runs `/remote-control` to reconnect it, in every open window (each checks every 5 seconds) that had Remote Control: you ran `/remote-control` there, the Claude mobile app is attached, or, in the terminal, `remoteControlAtStartup` is on. The desktop app's and VS Code's own auto-connect toggles can't be read by a plugin, so run `/remote-control` there yourself once.
 - **The desktop app:** each of its sessions uses the app's own account, whatever the plugin sets, so `/profile <name>`, `/profile api` and switching when an account runs out work only in `claude` in a terminal. A desktop session shows the app's account in its row. A tested limit of Claude Code there, not something a plugin can change.
 - **Windows is untested:** macOS is tested in daily use and Linux by the test suite; Windows follows the same file layout as Linux but hasn't been run yet, and the status line isn't set up there automatically. Reports welcome.
 - **API credit:** while on it, claude.ai-only features (connectors, artifacts) are off, as in any API-key session. The key is in this session's environment as `ANTHROPIC_API_KEY`, as with `ANTHROPIC_API_KEY=… claude`. The plugin blanks it, and a switched account's token, out of every tool's output and every message the conversation keeps, so a command that prints the environment doesn't put it in the transcript; a command run there can still use it, so give the key a workspace spend limit. Switching to it approves the key for Claude Code the way its own prompt does (the key's last 20 characters under `customApiKeyResponses` in `~/.claude.json`).
 - **A goal that ends by itself:** a plugin can't see a goal being met or judged impossible, so until `/goal clear` or `/clear` a used-up plan still switches without asking.
-- `CLAUDE_CONFIG_DIR` isn't supported: the plugin swaps the default login only.
+- `CLAUDE_CONFIG_DIR` isn't supported: the plugin uses the default login only.
 - With `CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC` set, the plan's usage figures can't be read: a switched session shows no usage bars, and fails over only on a reading it already had.
 - If something goes wrong, `/login` always gets you a working login again.
