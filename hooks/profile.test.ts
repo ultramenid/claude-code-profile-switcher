@@ -65,8 +65,16 @@ function stage(on: any, answers: string[] = []) {
     renewals: {} as Record<string, string>, // the token endpoint: a refresh token it takes once, and the access token it hands back
     isLockHeld: false, // another process holds Claude Code's refresh lock
     loginDir: undefined as string | undefined, // the CLAUDE_CONFIG_DIR a running `claude auth login` writes to
+    transcript: [] as string[], // this session's transcript lines
   }
   on('session.id', () => ({ value: session.id }))
+  /** An entry Claude Code writes in the transcript as a goal is set, judged, met or cleared. */
+  const goalStatus = (a: object) => session.transcript.push(JSON.stringify({ type: 'attachment', attachment: { type: 'goal_status', ...a } }))
+  on('command.run', { command: 'goal' }, (_$: any, e: any) => {
+    const arg = e.args.trim()
+    if (arg) goalStatus({ met: /^(clear|stop|off|reset|none|cancel)$/i.test(arg), sentinel: true, condition: arg })
+    return { text: '' }
+  })
   // Claude Code's order: ANTHROPIC_AUTH_TOKEN, then an approved ANTHROPIC_API_KEY, then the login.
   on('session.authorize', () => {
     if (session.isAuthorizeBroken) return { value: null }
@@ -93,7 +101,7 @@ function stage(on: any, answers: string[] = []) {
     }
     const status = session.usageStatus[cred]
     if (status) return { value: { status, ok: false, headers: {}, text: '' } }
-    const body = e.url === 'https://api.anthropic.com/api/oauth/usage' ? plan[cred] : undefined
+    const body = e.url === 'https://api.anthropic.com/api/oauth/usage' ? plan[cred] ?? {} : undefined // a login it takes, with no windows to report
     return { value: body ? { status: 200, ok: true, headers: {}, text: JSON.stringify(body) } : { status: 401, ok: false, headers: {}, text: '' } }
   })
   on('ui.open', (_$: any, e: any) => (panes.add(e.id), { value: { isPlaced: true } }))
@@ -126,6 +134,8 @@ function stage(on: any, answers: string[] = []) {
       return out(Object.keys(keychain).filter(k => k.startsWith('cc-swap-login|')).map(k => `    "acct"<blob>="${k.split('|')[1]}"`).join('\n'))
     }
     if (a[0] === 'sh' && a[4] === '/home/u/.claude/.oauth_refresh.lock') return out('', session.isLockHeld ? 1 : 0)
+    if (a[0] === 'sh' && a[6]?.includes('goal_status')) // grep -E over ~/.claude/projects/*/<id>.jsonl
+      return out(a[4] === '/home/u/.claude/projects' && a[5] === session.id ? session.transcript.filter(l => new RegExp(a[6]!).test(l)).slice(-3).join('\n') : '')
     if (a[0] !== 'security') return out('')
     if (a[1] === '-i') {
       if (session.isKeychainBroken) return out('', 1)
@@ -173,7 +183,7 @@ function stage(on: any, answers: string[] = []) {
     session.holds[handle] = { reached, shut }
     return { reached: isReached, open }
   }
-  return { keychain, env, argvs, signIn, liveEmail, liveToken, tokens, clock, files, remote, surfaces, rateLimits, panes, plan, context, session, toasts, asked, model, holdUsage, store }
+  return { keychain, env, argvs, signIn, liveEmail, liveToken, tokens, clock, files, remote, surfaces, rateLimits, panes, plan, context, session, toasts, asked, model, holdUsage, store, goalStatus }
 }
 
 test('add captures a full login and puts the current one back; switching moves this session alone', async ($, on) => {
@@ -376,7 +386,6 @@ test('a switched session reads its plan with its own token, whatever the engine 
 test('a request refused for a used-up plan goes again on another account: asked first, by itself during a /goal', async ($, on) => {
   const { env, signIn, clock, rateLimits, keychain, toasts, files, holdUsage, session, tokens } = stage(on, ['Switch to work'])
   const sent: (string | undefined)[] = []
-  on('command.run', { command: 'goal' }, () => ({ text: '' }))
   on('turn.step', async function* (_$: any, e: any) { // the API: main, the login the session started on, is used up
     sent.push(env.ANTHROPIC_AUTH_TOKEN)
     const isOut = !env.ANTHROPIC_AUTH_TOKEN?.startsWith('t-work')
@@ -434,7 +443,6 @@ test('API credit comes after every account: pasted in a box, offered when asked,
   const { env, signIn, clock, rateLimits, panes, files, plan, toasts } = stage(on, ['Use API credit', 'Switch to work', 'Use API credit'])
   const KEY = 'sk-ant-api03-test-0123456789abcdefghijWXYZ'
   const sent: string[] = []
-  on('command.run', { command: 'goal' }, () => ({ text: '' }))
   on('tool.call', { tool: 'Bash' }, () => { // `env`, as Bash would print it
     const out = `ANTHROPIC_API_KEY=${env.ANTHROPIC_API_KEY}\nHOME=/home/u\n`
     return { result: { stdout: out, stderr: '', interrupted: false }, text: out, ref: 1 }
@@ -1153,8 +1161,8 @@ test("plan readings land on the right account: one in flight during a switch kee
 
 test("goals and API credit: a goal the model sets runs unattended, an expired login that can't be renewed is named, clearing the goal stops the billing it took by itself", async ($, on) => {
   const s = stage(on) // nobody answers: a question is dismissed
-  on('tool.call', { tool: 'ProposeGoal' }, (_$: any, e: any) => ({ result: { condition: e.condition, askUser: false } }))
-  on('command.run', { command: 'goal' }, () => ({ text: '' }))
+  on('tool.call', { tool: 'ProposeGoal' }, (_$: any, e: any) => ( // Claude Code sets the goal as /goal does
+    s.goalStatus({ met: false, sentinel: true, condition: e.condition }), { result: { condition: e.condition, askUser: false } }))
   const sent = api(on, s)
   await start($)
   await added($, s, 'work', 't-work', 'w@x')
@@ -1175,6 +1183,68 @@ test("goals and API credit: a goal the model sets runs unattended, an expired lo
   expect((await step($)).answer).toBe('') // asked, and dismissed: not billed
   expect(sent).toEqual(['main'])
   expect(s.asked[0]).toContain("work's saved login couldn't be renewed")
+})
+
+test("a goal is read from the transcript as Claude Code reads it: one from before a resume runs unattended, one met by itself doesn't", async ($, on) => {
+  const s = stage(on) // nobody answers: a question is dismissed
+  const sent = api(on, s)
+  await start($)
+  await added($, s, 'work', 't-work', 'w@x')
+  s.goalStatus({ met: false, sentinel: true, condition: 'ship it' }) // set before this process started: no /goal ran here
+  s.goalStatus({ met: false, condition: 'ship it', reason: 'not yet' }) // judged, and going on
+  for (const quoted of ['{"attachment":{"type":"goal_status","met":true}}', 'grep -hE ".attachment.:\\{.type.:.goal_status"']) // talk of goals: not goal entries
+    for (let i = 0; i < 3; i++) s.session.transcript.push(JSON.stringify({ type: 'user', message: { content: quoted } }))
+  expect((await step($)).answer).toBe('ok')
+  expect(sent).toEqual(['main', 't-work'])
+  expect(s.asked).toEqual([])
+
+  await run($, 'main')
+  s.goalStatus({ met: true, condition: 'ship it', iterations: 2 }) // met by itself: no /goal clear
+  sent.length = 0
+  expect((await step($)).answer).toBe('') // asked, and dismissed
+  expect(sent).toEqual(['main'])
+  expect(s.asked).toEqual(['main is out of usage. Switch to work and continue?'])
+})
+
+test("a login refused outright fails over like a used-up plan, and isn't picked again; one another window renewed meanwhile goes again on the fresh token", async ($, on) => {
+  const s = stage(on) // nobody answers: a question is dismissed
+  const sent: string[] = []
+  const dead = new Set<string>()
+  on('turn.step', async function* (_$: any, e: any) { // the API: a dead token is refused; main runs out once its window says so
+    const who = s.env.ANTHROPIC_AUTH_TOKEN ?? 'main'
+    sent.push(who)
+    const isOk = !dead.has(who) && !(who === 'main' && s.rateLimits.length)
+    return { turnId: e.turnId, index: e.index, answer: isOk ? 'ok' : '', toolUses: [], stopReason: isOk ? 'end_turn' : null, usage: null }
+  })
+  const kill = (tok: string) => (dead.add(tok), (s.session.usageStatus[tok] = 401))
+  await start($)
+  await added($, s, 'work', 't-work', 'w@x')
+  await command($, 'goal', 'ship it')
+  expect(await run($, 'work')).toContain('✓ Switched to work')
+
+  // Another window renews work while this one's request is out: the copy it sent is revoked.
+  kill('t-work')
+  const held = s.holdUsage('t-work')
+  const going = step($)
+  await held.reached
+  s.keychain['cc-swap-login|work'] = JSON.stringify({ ...JSON.parse(s.keychain['cc-swap-login|work']!), creds: creds('t-work-2') })
+  held.open()
+  expect((await going).answer).toBe('ok')
+  expect(sent).toEqual(['t-work', 't-work-2'])
+
+  kill('t-work-2') // revoked for good, say its refresh key spent elsewhere
+  sent.length = 0
+  expect((await step($)).answer).toBe('ok')
+  expect(sent).toEqual(['t-work-2', 'main'])
+  expect(s.env.ANTHROPIC_AUTH_TOKEN).toBeUndefined()
+  expect(s.toasts.at(-1)).toBe("work's login was refused · switched to main to keep the goal going · /profile remove work, then /profile add work")
+
+  s.rateLimits.splice(0, 9, { kind: 'five_hour', percentUsed: 100 }) // main runs out: work's refused token isn't tried again
+  sent.length = 0
+  expect((await step($)).stopReason).toBeNull()
+  expect(sent).toEqual(['main'])
+  expect(s.toasts.at(-1)).toBe("main is out of usage · work: couldn't renew the saved login, /profile remove and /profile add it again")
+  expect(s.asked).toEqual([])
 })
 
 test('steps running out together ask once, even when the answer is to stay', async ($, on) => {

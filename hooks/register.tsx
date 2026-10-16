@@ -922,6 +922,8 @@ async function backFromApi($: EngineInterface) {
 const isOut = (list: Limit[] | undefined, now: number, hasExtra: unknown) =>
   !hasExtra && !!list?.some(l => l.percentUsed >= 100 && (!l.resetsAt || Date.parse(l.resetsAt) > now))
 
+const refused = new Set<string>() // access tokens the API refused outright: no fallback picks them again
+
 /** The first signed-in account, in list order, with usage left and a token this session can use; `expired`: skipped, their saved login dead. */
 async function spare($: EngineInterface, now: number, skip?: string): Promise<{ to?: string; expired: string[] }> {
   const live = await current($)
@@ -932,10 +934,37 @@ async function spare($: EngineInterface, now: number, skip?: string): Promise<{ 
     if (!login) continue
     // A saved copy nothing used for hours has expired: renewed here, else this session can't use it.
     // The shared login needn't be: switching to it drops the token, and Claude Code renews its own.
-    if (name === live || (await renew($, name, login))) return { to: name, expired }
+    const fresh = name === live ? login : await renew($, name, login)
+    if (fresh && !refused.has(accessToken(fresh.creds) ?? '')) return { to: name, expired }
     expired.push(name)
   }
   return { expired }
+}
+
+/**
+ * Whether a goal runs in this session, read as Claude Code reads it back on a resume: the transcript's last
+ * goal_status entry, unless it's met or failed (a /goal clear writes a met one). So a goal Claude set counts,
+ * and a resumed one; one met or judged impossible by itself doesn't.
+ */
+async function goalRuns($: EngineInterface): Promise<boolean> {
+  const projects = `${await home($)}/.claude/projects`
+  const id = await $.session.id()
+  // The entry's own `"attachment":{"type":"goal_status"`, never one quoted in a message or a command (`\"attachment\":…`).
+  const entry = '.attachment.:\\{.type.:.goal_status'
+  // ponytail: Windows untested, like the rest there.
+  const argv = (await platform($)) === 'win'
+    ? ['powershell', '-NoProfile', '-Command', `Select-String -Path '${projects.replace(/\//g, '\\')}\\*\\${id}.jsonl' -Pattern '${entry}' | Select-Object -Last 3 | ForEach-Object Line`]
+    : ['sh', '-c', 'grep -hE "$3" "$1"/*/"$2".jsonl 2>/dev/null | tail -n 3', 'sh', projects, id, entry]
+  const r = await $.process.run(argv).catch(() => undefined)
+  const last = (r?.stdout ?? '').split('\n').flatMap(line => {
+    try {
+      const a = JSON.parse(line).attachment
+      return a?.type === 'goal_status' ? [a] : []
+    } catch {
+      return []
+    }
+  }).at(-1)
+  return !!last && !last.met && !last.failed
 }
 
 /** This session's credentials as they ride in its environment, which every Bash command inherits. */
@@ -967,38 +996,56 @@ async function awaitSwitch($: EngineInterface, switched: Promise<boolean>, signa
 }
 
 /**
- * The live account's plan is used up: switch to a signed-in one whose isn't, else to
- * the `api` profile. By itself while a /goal runs (nobody may be watching), else once
- * the person agrees.
+ * The live account's plan is used up, or its login refused: switch to a signed-in one whose
+ * isn't, else to the `api` profile. By itself while a goal runs (nobody may be watching),
+ * else once the person agrees. True once this session sends something else.
  */
 async function failover($: EngineInterface): Promise<boolean> {
   if ((await onApi($)) || (await isDesktop($))) return false // API credit is the last stop; a desktop session can't move
-  const isGoal = await $.store.get(`goal:${await $.session.id()}`)
+  const isGoal = await goalRuns($)
   if (!isGoal && declined === (await credential($))) return false // asked already: steps in flight ran out too
   const now = await $.clock.now()
   const from = await active($)
   // The plan's reading says whether extra usage is left. Switched, the engine's reading
   // may be the login this process loaded: no plan reading, no telling.
   let rateLimits = await planUsage($, true)
-  if (!rateLimits?.length) rateLimits = (await using($)) ? await limits($, from) : (await $.session.usage()).rateLimits
-  if (!isOut(rateLimits, now, await $.store.get(`extra:${from}`))) return false // failed for another reason
-  // So no fallback picks it till it resets; a window that doesn't say when has reset by its full length.
-  const span = (kind: string) => (kind === 'seven_day' ? 7 * 24 : 5) * 3_600_000
-  await keep($, from, rateLimits!.map(l => ({ ...l, resetsAt: l.resetsAt ?? new Date(now + span(l.kind)).toISOString() })))
+  // Refused outright (revoked, or its refresh key spent): unless another window was renewing it just
+  // then, the login is no more use than a used-up plan.
+  let isDead = !rateLimits && usageError === 'HTTP 401'
+  if (isDead) {
+    const held = await credential($)
+    await locked($, async () => undefined) // a renewal elsewhere writes its token back before letting go
+    await syncToken($).catch(() => undefined)
+    if ((await credential($)) !== held) return true // renewed meanwhile: go again on the fresh token
+    rateLimits = await planUsage($, true)
+    isDead = !rateLimits && usageError === 'HTTP 401'
+  }
+  if (isDead) {
+    for (const tok of [await $.env.get('ANTHROPIC_AUTH_TOKEN'), accessToken((await loginOf($, from))?.creds)]) if (tok) refused.add(tok)
+  } else {
+    if (!rateLimits?.length) rateLimits = (await using($)) ? await limits($, from) : (await $.session.usage()).rateLimits
+    if (!isOut(rateLimits, now, await $.store.get(`extra:${from}`))) return false // failed for another reason
+    // So no fallback picks it till it resets; a window that doesn't say when has reset by its full length.
+    const span = (kind: string) => (kind === 'seven_day' ? 7 * 24 : 5) * 3_600_000
+    await keep($, from, rateLimits!.map(l => ({ ...l, resetsAt: l.resetsAt ?? new Date(now + span(l.kind)).toISOString() })))
+  }
+  const lead = isDead ? `${from}'s login was refused` : `${from} is out of usage`
+  const fix = !isDead ? '' : from === (await current($)) ? ` · /login to sign ${from} in again` : ` · /profile remove ${from}, then /profile add ${from}`
+  const others = isDead ? 'every other account is out of usage' : 'so is every other account'
   const { to, expired } = await spare($, now, from)
   const key = await apiKey($)
   const dead = expired.length ? ` · ${expired.join(', ')}: couldn't renew the saved login, /profile remove and /profile add it again` : ''
   if (!to && !key) {
-    $.ui.toast(expired.length ? `${from} is out of usage${dead}` : `${from} is out of usage, and so is every other account`, { timeoutMs: 8000 })
+    $.ui.toast(`${lead}${expired.length ? '' : `, and ${others}`}${fix}${dead}`, { timeoutMs: 8000 })
     return false
   }
   // A goal takes the next account, API credit only after the last; asked, either is offered.
   let choice = to ?? API
   if (!isGoal) {
     const credit = `Console key …${key?.slice(-4)}, billed per token`
-    const question = !to ? `${from} ${expired.length ? `is out of usage, and ${expired.join(', ')}'s saved login couldn't be renewed` : 'and every other account are out of usage'}. Continue on API credit (${credit})?`
-      : key ? `${from} is out of usage. Continue on ${to}, or on API credit (${credit})?`
-      : `${from} is out of usage. Switch to ${to} and continue?`
+    const question = !to ? `${lead}, and ${expired.length ? `${expired.join(', ')}'s saved login couldn't be renewed` : others}. Continue on API credit (${credit})?`
+      : key ? `${lead}. Continue on ${to}, or on API credit (${credit})?`
+      : `${lead}. Switch to ${to} and continue?`
     const options = [...(to ? [`Switch to ${to}`] : []), ...(key ? ['Use API credit'] : []), `Stay on ${from}`]
     const answer = await $.ui.ask(question, { header: 'Usage', options }).catch(() => undefined)
     if (answer === 'Use API credit') choice = API
@@ -1010,11 +1057,12 @@ async function failover($: EngineInterface): Promise<boolean> {
   // Chosen over an account with usage left, API credit stays till /profile <name>.
   const said = choice === API ? await useApi($, !to) : await use($, choice)
   if (!said.startsWith('✓')) {
-    $.ui.toast(`${from} is out of usage, and the switch didn't happen: ${said.replace(/^! /, '')}`, { timeoutMs: 8000 })
+    $.ui.toast(`${lead}, and the switch didn't happen: ${said.replace(/^! /, '')}`, { timeoutMs: 8000 })
     return false
   }
-  if (isGoal) {
-    $.ui.toast(choice !== API ? `${from} is out of usage · switched to ${choice} to keep the goal going` : `${expired.length ? `${from} is out of usage` : 'Every account is out of usage'} · on API credit to keep the goal going${dead}`, { timeoutMs: 8000 })
+  if (isGoal || isDead) {
+    const going = isGoal ? ' to keep the goal going' : ''
+    $.ui.toast(choice !== API ? `${lead} · switched to ${choice}${going}${fix}` : `${expired.length || isDead ? lead : 'Every account is out of usage'} · on API credit${going}${fix}${dead}`, { timeoutMs: 8000 })
   }
   return true
 }
@@ -1157,9 +1205,9 @@ export const register: Register = on => {
     return next(e)
   })
 
-  // A request refused for a used-up plan ends the turn and pauses a /goal: send it
-  // again on another account, or API credit, instead. A changed credential means
-  // another step already switched.
+  // A request refused for a used-up plan or a dead login ends the turn and pauses a
+  // goal: send it again on another account, or API credit, instead. A changed
+  // credential means another step already switched.
   on('turn.step', async function* ($, e, next) {
     for (;;) {
       const held = await credential($)
@@ -1180,8 +1228,6 @@ export const register: Register = on => {
   on('tool.call', async ($, e, next) => {
     const inherited = await secrets($) // what the tool's process starts with: a switch while it runs changes the env, not its output
     const r = await next(e)
-    // The model can set a goal itself; it runs unattended like a /goal.
-    if (e.tool === 'ProposeGoal' && !r.deny && !r.isError) await $.store.set(`goal:${await $.session.id()}`, true).catch(() => undefined)
     const hidden = [...new Set([...inherited, ...(await secrets($))])]
     if (!hidden.length) return r
     const raw = `${r.text ?? ''}${JSON.stringify(r.result ?? '')}`
@@ -1199,15 +1245,9 @@ export const register: Register = on => {
     return next({ ...e, message: { ...e.message, content: JSON.parse(blank(hidden, raw)) } })
   })
 
-  // ponytail: a goal that ends by itself (met, impossible) is invisible to a plugin, so it
-  // counts till /goal clear or /clear; read the transcript's goal entries if that bites.
+  // API credit the goal took by itself stops with /goal clear: the next refusal asks.
   on('command.run', { command: 'goal' }, async ($, e, next) => {
-    const arg = e.args.trim()
-    const key = `goal:${await $.session.id()}`
-    const isClear = /^(clear|stop|off|reset|none|cancel)$/i.test(arg)
-    if (arg) await (isClear ? $.store.delete(key) : $.store.set(key, true))
-    // API credit the goal took by itself stops with it: the next refusal asks.
-    if (isClear) await serial(async () => {
+    if (/^(clear|stop|off|reset|none|cancel)$/i.test(e.args.trim())) await serial(async () => {
       if (!(await $.env.get('CLAUDE_PROFILE_API_AUTO')) || !(await onApi($))) return
       await leaveApi($)
       await $.env.set('CLAUDE_PROFILE_USING', undefined)
@@ -1218,7 +1258,6 @@ export const register: Register = on => {
 
   // A conversation ends (exit, /clear, a resume): its keys go, and the next one's status line is drawn.
   on('session.end', async ($, e, next) => {
-    await $.store.delete(`goal:${e.sessionId}`).catch(() => undefined)
     await $.store.delete(`cache:${e.sessionId}`).catch(() => undefined)
     if (e.reason === 'clear' || e.reason === 'resume') $.clock.after(1000, () => void show($).catch(() => undefined))
     return next(e)
