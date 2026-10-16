@@ -134,8 +134,8 @@ function stage(on: any, answers: string[] = []) {
       return out(Object.keys(keychain).filter(k => k.startsWith('cc-swap-login|')).map(k => `    "acct"<blob>="${k.split('|')[1]}"`).join('\n'))
     }
     if (a[0] === 'sh' && a[4] === '/home/u/.claude/.oauth_refresh.lock') return out('', session.isLockHeld ? 1 : 0)
-    if (a[0] === 'sh' && a[6]?.includes('goal_status')) // grep -E over ~/.claude/projects/*/<id>.jsonl
-      return out(a[4] === '/home/u/.claude/projects' && a[5] === session.id ? session.transcript.filter(l => new RegExp(a[6]!).test(l)).slice(-3).join('\n') : '')
+    if (a[0] === 'sh' && a[2]!.includes('goal_status')) // grep over ~/.claude/projects/*/<id>.jsonl
+      return out(a[4] === '/home/u/.claude/projects' && a[5] === session.id ? session.transcript.filter(l => l.includes(a[6]!) && l.includes('goal_status')).slice(-20).join('\n') : '')
     if (a[0] !== 'security') return out('')
     if (a[1] === '-i') {
       if (session.isKeychainBroken) return out('', 1)
@@ -1192,8 +1192,9 @@ test("a goal is read from the transcript as Claude Code reads it: one from befor
   await added($, s, 'work', 't-work', 'w@x')
   s.goalStatus({ met: false, sentinel: true, condition: 'ship it' }) // set before this process started: no /goal ran here
   s.goalStatus({ met: false, condition: 'ship it', reason: 'not yet' }) // judged, and going on
-  for (const quoted of ['{"attachment":{"type":"goal_status","met":true}}', 'grep -hE ".attachment.:\\{.type.:.goal_status"']) // talk of goals: not goal entries
-    for (let i = 0; i < 3; i++) s.session.transcript.push(JSON.stringify({ type: 'user', message: { content: quoted } }))
+  // Talk of goals, not goal entries: quoted in a message, and in a file Claude Code attached.
+  s.session.transcript.push(JSON.stringify({ type: 'user', message: { content: '{"type":"attachment","attachment":{"type":"goal_status","met":true}}' } }))
+  s.session.transcript.push(JSON.stringify({ type: 'attachment', attachment: { type: 'edited_text_file', snippet: "a?.type === 'goal_status'" } }))
   expect((await step($)).answer).toBe('ok')
   expect(sent).toEqual(['main', 't-work'])
   expect(s.asked).toEqual([])
@@ -1245,6 +1246,24 @@ test("a login refused outright fails over like a used-up plan, and isn't picked 
   expect(sent).toEqual(['main'])
   expect(s.toasts.at(-1)).toBe("main is out of usage · work: couldn't renew the saved login, /profile remove and /profile add it again")
   expect(s.asked).toEqual([])
+
+  await run($, 'work') // back on it by hand, with nowhere left to go: the way out starts with leaving it
+  expect((await step($)).stopReason).toBeNull()
+  expect(s.toasts.at(-1)).toBe("work's login was refused, and every other account is out of usage · /profile main, then /profile remove work, then /profile add work")
+})
+
+test("a token the session was started with isn't taken for a dead login when the usage endpoint refuses it", async ($, on) => {
+  const s = stage(on)
+  s.env.ANTHROPIC_AUTH_TOKEN = 't-gateway' // `ANTHROPIC_AUTH_TOKEN=… claude`, say a gateway's
+  s.session.usageStatus['t-gateway'] = 401
+  on('turn.step', async function* (_$: any, e: any) { // the gateway fails a request, for its own reasons
+    return { turnId: e.turnId, index: e.index, answer: '', toolUses: [], stopReason: null, usage: null }
+  })
+  await start($)
+  await added($, s, 'work', 't-work', 'w@x')
+  await command($, 'goal', 'ship it')
+  expect((await step($)).stopReason).toBeNull()
+  expect(s.env.ANTHROPIC_AUTH_TOKEN).toBe('t-gateway') // never swapped for work's
 })
 
 test('steps running out together ask once, even when the answer is to stay', async ($, on) => {

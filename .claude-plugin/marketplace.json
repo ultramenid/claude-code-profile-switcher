@@ -10,7 +10,7 @@
     {
       "name": "profile",
       "description": "Switch Claude Code between accounts per session: /profile add <name> signs one in, /profile <name> moves this session to it.",
-      "version": "0.5.3",
+      "version": "0.5.4",
       "source": "./",
       "category": "productivity"
     }

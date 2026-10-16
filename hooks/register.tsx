@@ -55,8 +55,8 @@ let usageError: string | undefined // why the last read failed, which /usage sho
 const fetchSoon = ($: EngineInterface, url: string, init: HttpInit) =>
   Promise.race([$.http.fetch(url, init).catch(() => undefined), $.clock.sleep(10_000).then(() => undefined)])
 
-/** The live credential's windows from the usage endpoint, kept as its account's reading; undefined off a subscription or on failure. */
-async function planUsage($: EngineInterface, force = false): Promise<Limit[] | undefined> {
+/** The live credential's windows from the usage endpoint, kept as its account's reading; undefined off a subscription or on failure. `read.status`: the endpoint's answer, when it gave one. */
+async function planUsage($: EngineInterface, force = false, read: { status?: number } = {}): Promise<Limit[] | undefined> {
   const now = await $.clock.now()
   if (now < usageBackoff || (!force && now < usageNext)) return undefined
   // A switched session's own token, sent as is: whatever the engine makes of its credentials then, the read is that account's.
@@ -69,6 +69,7 @@ async function planUsage($: EngineInterface, force = false): Promise<Limit[] | u
     const beta = { 'anthropic-beta': 'oauth-2025-04-20' }
     const res = await fetchSoon($, USAGE_URL, held ? { headers: { ...beta, Authorization: `Bearer ${held}` } } : { auth: auth!.handle, headers: beta })
     if (!res) return void (usageError = 'no answer within 10s')
+    read.status = res.status
     if (res.status === 429) usageBackoff = now + 300_000
     if (!res.ok) return void (usageError = `HTTP ${res.status}${res.status === 429 ? ', tried again in 5 minutes' : ''}`)
     usageError = undefined
@@ -949,21 +950,23 @@ async function spare($: EngineInterface, now: number, skip?: string): Promise<{ 
 async function goalRuns($: EngineInterface): Promise<boolean> {
   const projects = `${await home($)}/.claude/projects`
   const id = await $.session.id()
-  // The entry's own `"attachment":{"type":"goal_status"`, never one quoted in a message or a command (`\"attachment\":…`).
-  const entry = '.attachment.:\\{.type.:.goal_status'
+  // Each file's last few: an entry of the transcript's own has `"type":"attachment"` unquoted, where
+  // talk of goals in a message or command has it escaped. The parse below drops any other.
   // ponytail: Windows untested, like the rest there.
   const argv = (await platform($)) === 'win'
-    ? ['powershell', '-NoProfile', '-Command', `Select-String -Path '${projects.replace(/\//g, '\\')}\\*\\${id}.jsonl' -Pattern '${entry}' | Select-Object -Last 3 | ForEach-Object Line`]
-    : ['sh', '-c', 'grep -hE "$3" "$1"/*/"$2".jsonl 2>/dev/null | tail -n 3', 'sh', projects, id, entry]
+    ? ['powershell', '-NoProfile', '-Command', `Get-ChildItem -Path '${projects.replace(/\//g, '\\').replace(/'/g, "''")}\\*\\${id}.jsonl' | ForEach-Object { Select-String -LiteralPath $_.FullName -SimpleMatch -Pattern 'goal_status' | Select-Object -Last 50 | ForEach-Object Line }`]
+    : ['sh', '-c', 'for f in "$1"/*/"$2".jsonl; do grep -F "$3" "$f" 2>/dev/null | grep -F goal_status | tail -n 20; done', 'sh', projects, id, '"type":"attachment"']
   const r = await $.process.run(argv).catch(() => undefined)
-  const last = (r?.stdout ?? '').split('\n').flatMap(line => {
+  const entries = (r?.stdout ?? '').split('\n').flatMap(line => {
     try {
-      const a = JSON.parse(line).attachment
-      return a?.type === 'goal_status' ? [a] : []
+      const d = JSON.parse(line)
+      return d.attachment?.type === 'goal_status' ? [{ at: String(d.timestamp ?? ''), ...d.attachment }] : []
     } catch {
       return []
     }
-  }).at(-1)
+  })
+  // The newest, should a /cd or a worktree have left the session's transcript in two project folders.
+  const last = entries.sort((a, b) => a.at.localeCompare(b.at)).at(-1)
   return !!last && !last.met && !last.failed
 }
 
@@ -1002,26 +1005,32 @@ async function awaitSwitch($: EngineInterface, switched: Promise<boolean>, signa
  */
 async function failover($: EngineInterface): Promise<boolean> {
   if ((await onApi($)) || (await isDesktop($))) return false // API credit is the last stop; a desktop session can't move
-  const isGoal = await goalRuns($)
-  if (!isGoal && declined === (await credential($))) return false // asked already: steps in flight ran out too
+  const held = await credential($)
+  if (declined === held && !(await goalRuns($))) return false // asked already: steps in flight ran out too
   const now = await $.clock.now()
   const from = await active($)
   // The plan's reading says whether extra usage is left. Switched, the engine's reading
   // may be the login this process loaded: no plan reading, no telling.
-  let rateLimits = await planUsage($, true)
+  const read: { status?: number } = {}
+  let rateLimits = await planUsage($, true, read)
   // Refused outright (revoked, or its refresh key spent): unless another window was renewing it just
-  // then, the login is no more use than a used-up plan.
-  let isDead = !rateLimits && usageError === 'HTTP 401'
+  // then, the login is no more use than a used-up plan. Only a login the plugin knows: a token the
+  // session was started with (a gateway's, a setup-token) needn't be one the usage endpoint takes.
+  const isOurs = !!(await using($)) || !((await $.env.get('ANTHROPIC_AUTH_TOKEN')) || (await $.env.get('CLAUDE_CODE_OAUTH_TOKEN')))
+  let isDead = isOurs && read.status === 401
   if (isDead) {
-    const held = await credential($)
     await locked($, async () => undefined) // a renewal elsewhere writes its token back before letting go
     await syncToken($).catch(() => undefined)
     if ((await credential($)) !== held) return true // renewed meanwhile: go again on the fresh token
-    rateLimits = await planUsage($, true)
-    isDead = !rateLimits && usageError === 'HTTP 401'
+    const again: { status?: number } = {}
+    rateLimits = await planUsage($, true, again)
+    isDead = again.status === 401
   }
+  // The token this session sent: a switched one's. The shared login's stays pickable, as Claude Code
+  // may hold an older copy of it than the one that would be marked.
+  const sent = await $.env.get('ANTHROPIC_AUTH_TOKEN')
   if (isDead) {
-    for (const tok of [await $.env.get('ANTHROPIC_AUTH_TOKEN'), accessToken((await loginOf($, from))?.creds)]) if (tok) refused.add(tok)
+    if (sent) refused.add(sent)
   } else {
     if (!rateLimits?.length) rateLimits = (await using($)) ? await limits($, from) : (await $.session.usage()).rateLimits
     if (!isOut(rateLimits, now, await $.store.get(`extra:${from}`))) return false // failed for another reason
@@ -1029,14 +1038,18 @@ async function failover($: EngineInterface): Promise<boolean> {
     const span = (kind: string) => (kind === 'seven_day' ? 7 * 24 : 5) * 3_600_000
     await keep($, from, rateLimits!.map(l => ({ ...l, resetsAt: l.resetsAt ?? new Date(now + span(l.kind)).toISOString() })))
   }
+  const isGoal = await goalRuns($) // read after any wait above: a /goal clear meanwhile counts
+  const cur = await current($)
   const lead = isDead ? `${from}'s login was refused` : `${from} is out of usage`
-  const fix = !isDead ? '' : from === (await current($)) ? ` · /login to sign ${from} in again` : ` · /profile remove ${from}, then /profile add ${from}`
+  // How to sign it in again; a saved one can't be removed while this session is still on it.
+  const fix = (isMoved: boolean) => !isDead ? '' : from === cur ? ` · /login to sign ${from} in again`
+    : ` · ${isMoved ? '' : `/profile ${cur}, then `}/profile remove ${from}, then /profile add ${from}`
   const others = isDead ? 'every other account is out of usage' : 'so is every other account'
   const { to, expired } = await spare($, now, from)
   const key = await apiKey($)
   const dead = expired.length ? ` · ${expired.join(', ')}: couldn't renew the saved login, /profile remove and /profile add it again` : ''
   if (!to && !key) {
-    $.ui.toast(`${lead}${expired.length ? '' : `, and ${others}`}${fix}${dead}`, { timeoutMs: 8000 })
+    $.ui.toast(`${lead}${expired.length ? '' : `, and ${others}`}${fix(false)}${dead}`, { timeoutMs: 8000 })
     return false
   }
   // A goal takes the next account, API credit only after the last; asked, either is offered.
@@ -1057,12 +1070,12 @@ async function failover($: EngineInterface): Promise<boolean> {
   // Chosen over an account with usage left, API credit stays till /profile <name>.
   const said = choice === API ? await useApi($, !to) : await use($, choice)
   if (!said.startsWith('✓')) {
-    $.ui.toast(`${lead}, and the switch didn't happen: ${said.replace(/^! /, '')}`, { timeoutMs: 8000 })
+    $.ui.toast(`${lead}, and the switch didn't happen: ${said.replace(/^! /, '')}${fix(false)}`, { timeoutMs: 8000 })
     return false
   }
   if (isGoal || isDead) {
     const going = isGoal ? ' to keep the goal going' : ''
-    $.ui.toast(choice !== API ? `${lead} · switched to ${choice}${going}${fix}` : `${expired.length || isDead ? lead : 'Every account is out of usage'} · on API credit${going}${fix}${dead}`, { timeoutMs: 8000 })
+    $.ui.toast(choice !== API ? `${lead} · switched to ${choice}${going}${fix(true)}` : `${expired.length || isDead ? lead : 'Every account is out of usage'} · on API credit${going}${fix(true)}${dead}`, { timeoutMs: 8000 })
   }
   return true
 }
