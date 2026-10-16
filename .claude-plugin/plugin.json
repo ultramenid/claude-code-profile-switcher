@@ -1,6 +1,6 @@
 {
   "name": "profile",
-  "version": "0.5.1",
+  "version": "0.5.2",
   "description": "Switch Claude Code between accounts per session: /profile add <name> signs one in, /profile <name> moves this session to it.",
   "author": {
     "name": "ultramenid",

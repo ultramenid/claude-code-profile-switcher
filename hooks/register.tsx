@@ -1023,7 +1023,8 @@ async function remove($: EngineInterface, name: string): Promise<string> {
   const add = await adding($)
   const isAdding = add?.name === name // whichever window started it
   if (!isAdding && !(await names($)).includes(name)) return '! Usage: /profile remove <name>'
-  if (!isAdding && ((await current($)) === name || (await active($)) === name)) return `! ${name} is the active login · switch away first`
+  if (!isAdding && (await current($)) === name) return `! ${name} is the shared login, the one new windows open on · /login as another account first`
+  if (!isAdding && (await active($)) === name) return `! ${name} is the account this session uses · /profile to another first`
   if (!(await deleteSlot($, name))) return `! Couldn't remove ${name}'s saved login · nothing changed`
   pending.delete(name)
   await keep($, name, null) // a new account added under the name starts without them

@@ -201,7 +201,10 @@ test('add captures a full login and puts the current one back; switching moves t
   expect(env.ANTHROPIC_AUTH_TOKEN).toBeUndefined() // the shared login: Claude Code sends its own
 
   expect(await run($, 'main')).toBe('✓ Already on main')
-  expect(await run($, 'remove main')).toContain('switch away first')
+  expect(await run($, 'remove main')).toContain('main is the shared login')
+  await run($, 'work')
+  expect(await run($, 'remove work')).toContain('work is the account this session uses')
+  await run($, 'main')
   expect(await run($, 'remove work')).toBe('✓ Removed work')
   expect(keychain['cc-swap-login|work']).toBeUndefined()
   expect(await run($, 'nope')).toContain('No account nope')
@@ -483,7 +486,7 @@ test('API credit comes after every account: pasted in a box, offered when asked,
   expect(env.ANTHROPIC_AUTH_TOKEN).toBeUndefined() // it would outrank the key
   expect(JSON.parse(files['/home/u/.claude.json']!).customApiKeyResponses.approved).toEqual([KEY.slice(-20)])
   expect(await run($, 'list')).toContain('● api   API credit · key …WXYZ · active')
-  expect(await run($, 'remove api')).toContain('switch away first')
+  expect(await run($, 'remove api')).toContain('api is the account this session uses')
 
   await clock.advance(3_660_000) // the plans reset
   expect(env.ANTHROPIC_API_KEY).toBeUndefined()
