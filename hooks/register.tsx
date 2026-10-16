@@ -205,19 +205,52 @@ async function deleteSlot($: EngineInterface, name: string): Promise<boolean> {
 }
 
 /**
- * `claude auth login`, detached: it waits on the browser callback, far past a hook's 10s budget.
- * It stops when the add gives up (10 minutes), so a browser tab finished later can't replace the
- * live login; its pid, to stop it sooner.
+ * Where `/profile add` signs in: a Claude Code config folder of its own, so `claude auth login` writes
+ * its login and account there (on macOS, to a Keychain entry named for the folder), never over the
+ * login every window shares.
+ */
+const addDir = async ($: EngineInterface) => `${await home($)}/.claude/profile-add`
+
+/** The add folder's Keychain entry, as Claude Code names one for a CLAUDE_CONFIG_DIR: its path's sha256. */
+async function addService($: EngineInterface): Promise<string> {
+  const r = await $.process.run(['sh', '-c', 'printf %s "$1" | shasum -a 256', 'sh', await addDir($)])
+  const hash = /^[0-9a-f]{8}/.exec(r.stdout)?.[0]
+  if (!hash) throw new Error(`Couldn't name the sign-in's Keychain entry (shasum exit ${r.exitCode})`)
+  return `${LIVE}-${hash}`
+}
+
+/** The login and account `claude auth login` wrote in the add folder, once both are there. */
+async function addedLogin($: EngineInterface): Promise<Login | undefined> {
+  const dir = await addDir($)
+  const creds = (await platform($)) === 'mac' ? await getKey($, await addService($))
+    : (await $.fs.read(`${dir}/.credentials.json`).catch(() => '')).trim() || undefined
+  const oauthAccount = (await $.fs.read(`${dir}/.claude.json`).then(JSON.parse).catch(() => ({}))).oauthAccount
+  return creds && oauthAccount?.emailAddress && accessToken(creds) ? { creds, oauthAccount } : undefined
+}
+
+/** Empties the add folder, and on macOS its Keychain entry. */
+async function clearAdd($: EngineInterface) {
+  const dir = await addDir($)
+  const plat = await platform($)
+  if (plat === 'mac') await $.process.run(['security', 'delete-generic-password', '-s', await addService($)]).catch(() => undefined)
+  await $.process.run(plat === 'win' ? ['cmd', '/c', 'rmdir', '/s', '/q', dir.replace(/\//g, '\\')] : ['rm', '-rf', dir]).catch(() => undefined)
+}
+
+/**
+ * `claude auth login` in the add folder, detached: it waits on the browser callback, far past a
+ * hook's 10s budget. It stops when the add gives up (10 minutes); its pid, to stop it sooner.
  */
 async function startLogin($: EngineInterface, log: string): Promise<string | undefined> {
+  const dir = await addDir($)
   if ((await platform($)) === 'win') {
-    const cmd = `/c set "ANTHROPIC_AUTH_TOKEN=" & set "CLAUDE_CONFIG_DIR=" & claude auth login`
+    const cmd = `/c mkdir "${dir.replace(/\//g, '\\')}" & set "ANTHROPIC_AUTH_TOKEN=" & set "CLAUDE_CONFIG_DIR=${dir.replace(/\//g, '\\')}" & claude auth login`
     await $.process.run(['powershell', '-NoProfile', '-Command',
-      `Start-Process -WindowStyle Hidden -FilePath cmd.exe -ArgumentList '${cmd}' -RedirectStandardOutput '${log.replace(/'/g, "''")}'`])
+      `Start-Process -WindowStyle Hidden -FilePath cmd.exe -ArgumentList '${cmd.replace(/'/g, "''")}' -RedirectStandardOutput '${log.replace(/'/g, "''")}'`])
     return
   }
-  const r = await $.process.run(['sh', '-c', 'command -v claude >/dev/null || exit 127; nohup env -u CLAUDE_CONFIG_DIR -u ANTHROPIC_AUTH_TOKEN -u ANTHROPIC_API_KEY claude auth login >"$1" 2>&1 & p=$!; (sleep 600; ps -p $p -o command= | grep -q "auth login" && kill $p) >/dev/null 2>&1 & echo $p', 'sh', log])
+  const r = await $.process.run(['sh', '-c', 'command -v claude >/dev/null || exit 127; (umask 077 && mkdir -p "$2") || exit 1; CLAUDE_CONFIG_DIR="$2" nohup env -u ANTHROPIC_AUTH_TOKEN -u ANTHROPIC_API_KEY claude auth login >"$1" 2>&1 & p=$!; (sleep 600; ps -p $p -o command= | grep -q "auth login" && kill $p) >/dev/null 2>&1 & echo $p', 'sh', log, dir])
   if (r.exitCode === 127) throw new Error("`claude` isn't on the PATH plugins run with here, so the sign-in can't open · run /profile add from Claude Code in a terminal")
+  if (r.exitCode !== 0) throw new Error(`Couldn't make ${dir} for the sign-in (exit ${r.exitCode}) · nothing changed`)
   return /^\d+$/.exec(r.stdout.trim())?.[0]
 }
 
@@ -413,13 +446,8 @@ let seen: string | undefined
 async function watchLogin($: EngineInterface) {
   seen = await signedIn($)
   $.clock.every(5000, () => void (async () => {
-    if (pending.size) return // an add briefly swaps the login and puts it back
     const id = await signedIn($)
     if (id === undefined) return // unreadable for a moment (mid-write), or signed out: nothing to reconnect
-    if (await adding($)) { // another window's: reconnect once it's over, if the login moved meanwhile
-      if (id !== seen) seen = undefined
-      return
-    }
     if (id !== seen) await reconnectRemote($)
   })())
   // Another window's reading of this account, on the status line within seconds rather than at the next minute.
@@ -439,7 +467,18 @@ async function watchLogin($: EngineInterface) {
       await show($) // what other windows stored meanwhile, and the reset countdowns
     })().catch(() => undefined)
     void backFromApi($).catch(() => undefined)
+    void keepShared($).catch(() => undefined)
   })
+}
+
+/**
+ * Claude Code renews the shared login, spending the refresh key its account's saved copy holds: copy
+ * it there, under the refresh lock so no renewal is caught halfway, or a /login that replaces it
+ * leaves that account's saved login dead.
+ */
+async function keepShared($: EngineInterface) {
+  const name = await current($)
+  if ((await names($)).includes(name)) await locked($, () => save($, name))
 }
 
 /**
@@ -455,22 +494,6 @@ async function syncToken($: EngineInterface) {
   const tok = accessToken((login && (await renew($, name, login)))?.creds)
   // A switch meanwhile set (or dropped) its own token: never put this one back over it.
   if (tok && tok !== held && (await $.env.get('ANTHROPIC_AUTH_TOKEN')) === held && (await using($)) === name) await $.env.set('ANTHROPIC_AUTH_TOKEN', tok)
-}
-
-/** Makes `name`'s slot the live login. */
-async function load($: EngineInterface, name: string, login: Login) {
-  // Unreadable (over 4 MiB, half-written): stop before anything changes, never write it back without the rest.
-  const path = await configPath($)
-  JSON.parse(await $.fs.read(path))
-  const raw = await readLive($)
-  await writeLive($, JSON.stringify({ ...JSON.parse(raw ?? '{}'), claudeAiOauth: JSON.parse(login.creds).claudeAiOauth }))
-  try {
-    const config = JSON.parse(await $.fs.read(path)) // again: what Claude Code wrote meanwhile stays
-    await $.fs.write(path, `${JSON.stringify({ ...config, oauthAccount: login.oauthAccount }, null, 2)}\n`)
-  } catch (err) {
-    if (raw) await writeLive($, raw) // never one account's login under another's account
-    throw err
-  }
 }
 
 async function rows($: EngineInterface): Promise<Row[]> {
@@ -659,7 +682,7 @@ function until(iso: string | undefined, now: number): string | undefined {
 }
 
 // The add in progress, in a file every window reads (it outlives a plugin reload); `{}` once over.
-type Adding = { name: string; prev: string; prevAccount?: Login['oauthAccount']; until: number; pid?: string }
+type Adding = { name: string; until: number; pid?: string }
 const addingFile = async ($: EngineInterface) => `${await home($)}/.claude/profile-adding.json`
 const marker = async ($: EngineInterface): Promise<Adding | undefined> => $.fs.read(await addingFile($)).then(JSON.parse).catch(() => undefined)
 
@@ -669,21 +692,19 @@ async function adding($: EngineInterface): Promise<Adding | undefined> {
   return m && m.until > (await $.clock.now()) ? m : undefined
 }
 
-/** Ends this process's add, for every window. */
+/** Ends this process's add, for every window, and drops what its sign-in left in the add folder. */
 async function endAdd($: EngineInterface) {
   await $.fs.write(await addingFile($), '{}')
   await $.env.set('CLAUDE_PROFILE_ADDING', undefined)
+  await clearAdd($)
 }
 
 /**
- * `claude auth login` replaces the live login; once it has, copy it into the new
- * account's slot and put the previous account back. Gives up after 10 minutes, or
- * once the add is no longer marked (removed).
+ * `claude auth login` writes the new account's login in the add folder; once it's there whole,
+ * save it under the new name. Gives up after 10 minutes, or once the add is no longer marked (removed).
  */
 function watchSignIn($: EngineInterface, name: string) {
   let isBusy = false
-  let isSaved = false // the new account's slot written; putting the previous one back is what's left
-  let fresh: string | undefined // the previous account's credential, changed since the add: a refresh, or this sign-in written before its account
   const end = async (toast: string) => {
     timer.cancel()
     pending.delete(name)
@@ -699,42 +720,19 @@ function watchSignIn($: EngineInterface, name: string) {
         pending.delete(name)
         return timer.cancel() // removed
       }
-      const live = await liveLogin($)
-      const back = await slot($, m.prev)
-      const tok = accessToken(live?.creds)
-      const isPrev = !!live && sameAccount(live.oauthAccount, m.prevAccount)
-      if (m.until <= (await $.clock.now())) {
-        if (isPrev && tok !== accessToken(back?.creds)) await save($, m.prev) // a window refreshed it meanwhile
-        return end(isSaved
-          ? `✓ ${name} is saved, but ${m.prev} couldn't be put back · /profile ${m.prev} to switch back`
-          : `No new sign-in for ${name} in 10 minutes · /profile add ${name} to try again`)
-      }
-      if (!live || !tok || !live.oauthAccount?.emailAddress) return
-      if (isPrev || tok === accessToken(back?.creds)) { // still the previous account, or the new one written but not its credential
-        if (isPrev && tok !== accessToken(back?.creds)) fresh = live.creds
-        if (!isPrev || (await loginRunning($, m.pid))) return
-        // The sign-in finished as the account you're on: its new credential is that account's.
-        if (fresh) await save($, m.prev)
-        await reconnectRemote($)
-        return end(`That sign-in is ${m.prev}'s account, the one you're on, so ${name} wasn't saved · /profile add ${name} and sign in as another account (a private window helps)`)
-      }
-      // An account saved under another name already: two copies, and refreshing one revokes the other.
+      if (m.until <= (await $.clock.now())) return end(`No new sign-in for ${name} in 10 minutes · /profile add ${name} to try again`)
+      // The credential lands first, the account seconds later, and the sign-in exits once both have.
+      const login = await addedLogin($)
+      if (!login || (m.pid && (await loginRunning($, m.pid)))) return
+      // An account saved under another name already, the one you're on among them: one name each.
       let dup: string | undefined
-      for (const other of await names($)) if (other !== name && other !== API && sameAccount(live.oauthAccount, (await slot($, other))?.oauthAccount)) dup = other
-      if (!dup && !isSaved) {
-        await writeSlot($, name, JSON.stringify(own(live)))
-        isSaved = true
-      }
-      // A refresh of the previous account seen meanwhile is the copy put back; this sign-in's own credential seen early isn't.
-      const prev = back && fresh && accessToken(fresh) !== tok ? own({ ...back, creds: fresh }) : back
-      if (prev && prev !== back) await writeSlot($, m.prev, JSON.stringify(prev))
-      if (prev) await load($, m.prev, prev)
-      await reconnectRemote($)
+      for (const other of await names($)) if (other !== name && other !== API && sameAccount(login.oauthAccount, (await slot($, other))?.oauthAccount)) dup = other
+      if (!dup) await writeSlot($, name, JSON.stringify(own(login)))
       await end(dup
         ? `That sign-in is ${dup}'s account, so ${name} wasn't saved · /profile add ${name} and sign in as another account (a private window helps)`
-        : `✓ ${name} signed in as ${live.oauthAccount.emailAddress} · /profile ${name} to switch`)
+        : `✓ ${name} signed in as ${login.oauthAccount!.emailAddress} · /profile ${name} to switch`)
     } catch {
-      // A locked Keychain, a half-written ~/.claude.json: the next tick tries again.
+      // A locked Keychain, a half-written file, a failed write: the next tick tries again.
     } finally {
       isBusy = false
     }
@@ -747,15 +745,13 @@ async function add($: EngineInterface, name: string): Promise<string> {
   const busy = await adding($) // in any window
   if (busy) return `! The sign-in for ${busy.name} isn't finished · finish it first, or wait for it to give up`
   if (await slot($, name)) return `! ${name} is already signed in · /profile ${name} to switch, /profile remove ${name} to start over`
-  const live = await liveLogin($)
-  if (live && !live.oauthAccount) return `! Can't read your account from ~/.claude.json, so it can't be saved before the sign-in replaces it · nothing changed`
   const cur = await current($)
   if (name === cur) return `! ${name} is the login you're on · pick another name for the new account`
-  await save($, cur) // the login is about to replace it
-  const prevAccount = live?.oauthAccount
+  await save($, cur) // the account you're on, listed by name from now on, and told apart from the sign-in
+  await clearAdd($) // what an add given up on left behind
   const log = `${await home($)}/.claude/cc-swap-login.log`
   const pid = await startLogin($, log)
-  await $.fs.write(await addingFile($), JSON.stringify({ name, prev: cur, prevAccount, until: (await $.clock.now()) + 600_000, pid }))
+  await $.fs.write(await addingFile($), JSON.stringify({ name, until: (await $.clock.now()) + 600_000, pid }))
   await $.env.set('CLAUDE_PROFILE_ADDING', name) // this process's: a reload watches it again
   pending.add(name)
   watchSignIn($, name)

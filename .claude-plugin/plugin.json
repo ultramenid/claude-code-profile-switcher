@@ -1,7 +1,7 @@
 {
   "name": "profile",
-  "version": "0.5.0",
-  "description": "Switch Claude Code's login between accounts: /profile add <name> saves a full login, /profile <name> makes it the live one.",
+  "version": "0.5.1",
+  "description": "Switch Claude Code between accounts per session: /profile add <name> signs one in, /profile <name> moves this session to it.",
   "author": {
     "name": "ultramenid",
     "url": "https://github.com/ultramenid"

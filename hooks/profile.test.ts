@@ -13,6 +13,9 @@ const unhex = (h: string) => new TextDecoder().decode(new Uint8Array(h.match(/..
 const hex = (s: string) => Array.from(new TextEncoder().encode(s), b => b.toString(16).padStart(2, '0')).join('')
 const LIVE = 'Claude Code-credentials|me'
 const CONFIG = '/home/u/.claude.json'
+const ADD_HASH = '0123abcd' // what shasum prints for the add folder's path
+const ADD_KEY = `Claude Code-credentials-${ADD_HASH}` // its Keychain entry
+const ADD_CONFIG = '/home/u/.claude/profile-add/.claude.json'
 const command = ($: any, name: string, args = '') =>
   $.command.run({ command: name, args, origin: { kind: 'composer' }, presentation: { isFullscreen: false, columns: 80 } } as any)
 
@@ -61,6 +64,7 @@ function stage(on: any, answers: string[] = []) {
     holds: {} as Record<string, { reached: () => void; shut: Promise<void> }>, // usage reads held till opened
     renewals: {} as Record<string, string>, // the token endpoint: a refresh token it takes once, and the access token it hands back
     isLockHeld: false, // another process holds Claude Code's refresh lock
+    loginDir: undefined as string | undefined, // the CLAUDE_CONFIG_DIR a running `claude auth login` writes to
   }
   on('session.id', () => ({ value: session.id }))
   // Claude Code's order: ANTHROPIC_AUTH_TOKEN, then an approved ANTHROPIC_API_KEY, then the login.
@@ -108,7 +112,12 @@ function stage(on: any, answers: string[] = []) {
     argvs.push(a.join(' '))
     const out = (stdout: string, exitCode = 0) => ({ value: { exitCode, stdout, stderr: '', isStdoutTruncated: false, isStderrTruncated: false } })
     if (a[0] === 'uname') return session.isUnameBlocked ? { deny: 'refused' } : out('Darwin\n')
-    if (a[0] === 'sh' && a[2]!.includes('auth login')) return out(session.loginPid)
+    if (a[0] === 'sh' && a[2]!.includes('auth login')) return ((session.loginDir = a[5]), out(session.loginPid))
+    if (a[0] === 'sh' && a[2]!.includes('shasum')) return out(`${ADD_HASH}${'0'.repeat(56)}  -\n`)
+    if (a[0] === 'rm' && a[1] === '-rf') {
+      for (const p of Object.keys(files)) if (p.startsWith(`${a[2]}/`)) delete files[p]
+      if (a[2] === session.loginDir) session.loginDir = undefined
+    }
     if (a[0] === 'ps') return out(session.isLoginRunning ? 'node /usr/local/bin/claude auth login\n' : '')
     if (a[0] === 'security' && a.includes('-w') && session.readFailures > 0) return (session.readFailures--, out('', 36))
     if (a[0] === 'sh' && a[2]!.includes('dump-keychain')) {
@@ -140,8 +149,13 @@ function stage(on: any, answers: string[] = []) {
     if (ans === undefined) return { deny: 'dismissed' }
     return { result: { questions: e.questions, answers: { [e.questions[0].question]: ans } } }
   })
-  /** What `claude auth login` would do once the browser sign-in finishes. */
+  /** What `claude auth login` would do once the browser sign-in finishes: in an add's folder while one runs, else (a /login) the shared login. */
   const signIn = (tok: string, email: string) => {
+    if (session.loginDir) {
+      keychain[`${ADD_KEY}|me`] = creds(tok)
+      files[`${session.loginDir}/.claude.json`] = JSON.stringify({ oauthAccount: { emailAddress: email } })
+      return
+    }
     keychain['Claude Code-credentials|me'] = creds(tok)
     files['/home/u/.claude.json'] = JSON.stringify({ ...JSON.parse(files['/home/u/.claude.json']!), oauthAccount: { emailAddress: email } })
   }
@@ -287,35 +301,34 @@ test('an add is marked for every window till it ends: saved, given up after 10 m
   expect(keychain['cc-swap-login|home']).toBeUndefined()
 })
 
-test('another window adding: no second add here, and one Remote Control reconnect once it has put the login back', async ($, on) => {
-  const { files, remote, signIn, clock, argvs } = stage(on)
+test("another window adding: no second add here, and its sign-in never moves this window's login", async ($, on) => {
+  const { files, remote, signIn, clock, argvs, session, liveEmail } = stage(on)
   files['/home/u/.claude/settings.json'] = '{"remoteControlAtStartup":true}'
-  await $.session.start({ source: 'startup', cwd: '/p' } as any)
-  files[MARK] = JSON.stringify({ name: 'work', prev: 'main', prevAccount: { emailAddress: 'me@x' }, until: clock.now() + 600_000 })
+  await start($)
+  files[MARK] = JSON.stringify({ name: 'work', until: clock.now() + 600_000 })
   expect(await run($, 'add home')).toContain('The sign-in for work isn\'t finished')
   expect(argvs.some(a => a.includes('claude auth login'))).toBe(false)
-  signIn('t-work', 'w@x') // its sign-in, live till that window puts main back
-  await clock.advance(5000)
-  expect(remote.length).toBe(0)
-  signIn('t-main', 'me@x')
-  files[MARK] = '{}'
+  session.loginDir = '/home/u/.claude/profile-add' // that window's `claude auth login`
+  signIn('t-work', 'w@x')
   await clock.advance(5500)
-  expect(remote.length).toBe(1)
+  expect([remote.length, liveEmail()]).toEqual([0, 'me@x'])
 })
 
 test('a plugin reload mid-add (module state gone, the process environment kept) watches for the sign-in again', async ($, on) => {
-  const { keychain, env, files, signIn, liveEmail, clock } = stage(on)
-  // What /profile add left before the reload: main saved, the marker, this process's mark.
+  const { keychain, env, files, signIn, liveEmail, clock, session } = stage(on)
+  // What /profile add left before the reload: main saved, the marker, this process's mark, its sign-in running.
   keychain['cc-swap-login|main'] = JSON.stringify({ creds: creds('t-main'), oauthAccount: { emailAddress: 'me@x' } })
-  files[MARK] = JSON.stringify({ name: 'work', prev: 'main', prevAccount: { emailAddress: 'me@x' }, until: clock.now() + 600_000 })
+  files[MARK] = JSON.stringify({ name: 'work', until: clock.now() + 600_000 })
   env.CLAUDE_PROFILE_ADDING = 'work'
+  session.loginDir = '/home/u/.claude/profile-add'
   await $.session.start({ source: 'startup', cwd: '/p' } as any)
   expect(await run($, 'list')).toContain('○ work  sign-in pending')
   signIn('t-work', 'w@x')
   await clock.advance(3000)
   expect(JSON.parse(keychain['cc-swap-login|work']!).creds).toBe(creds('t-work'))
-  expect(liveEmail()).toBe('me@x') // main put back
+  expect(liveEmail()).toBe('me@x') // the shared login never moved
   expect(env.CLAUDE_PROFILE_ADDING).toBeUndefined()
+  expect([keychain[`${ADD_KEY}|me`], files[ADD_CONFIG]]).toEqual([undefined, undefined]) // the sign-in's copy cleared
 })
 
 test('plan usage is kept per account; a switched one reads its own from the plan, not the reading of the login the session started on', async ($, on) => {
@@ -750,16 +763,16 @@ test('the band above the prompt shows the account and its usage', async ($, on) 
   expect(plain('/home/u/.claude/profile-statusline/sess-1.txt')).toContain('Ctx: 12.0k')
 })
 
-test('reconnects Remote Control once an add puts the login back, when it is on at startup; a switch leaves it be', async ($, on) => {
+test('Remote Control on at startup stays connected through an add and a switch: the shared login, its own, never moves', async ($, on) => {
   const { files, remote, signIn, clock } = stage(on)
   files['/home/u/.claude/settings.json'] = '{"remoteControlAtStartup":true}'
+  await start($)
   await run($, 'add work')
   signIn('t-work', 'w@x')
-  await clock.advance(3500)
-  expect(remote.length).toBe(1) // after add put main back
+  await clock.advance(5500)
   await run($, 'work')
-  await clock.advance(500)
-  expect(remote.length).toBe(1) // the shared login, Remote Control's, didn't change
+  await clock.advance(5500)
+  expect(remote.length).toBe(0)
 })
 
 test('reconnects Remote Control for a phone attached, not for the desktop app', async ($, on) => {
@@ -881,6 +894,16 @@ test("a renewal waits on Claude Code's refresh lock, and takes what its holder r
   expect(s.argvs).toContain('rmdir /home/u/.claude/.oauth_refresh.lock') // released
 })
 
+test("the shared login's account keeps its saved copy current, so a /login over it leaves that account working", async ($, on) => {
+  const s = stage(on)
+  await start($)
+  await added($, s, 'work', 't-work', 'w@x') // main saved as it was then
+  s.keychain[LIVE] = creds('t-main-2') // Claude Code renewed main, spending the saved copy's refresh key
+  await s.clock.advance(60_000)
+  expect(s.tokens().main).toBe('t-main-2')
+  expect(s.argvs).toContain('rmdir /home/u/.claude/.oauth_refresh.lock') // copied under the refresh lock
+})
+
 test('bare /profile picks from a dialog, falls back to the list', async ($, on) => {
   const { signIn, clock } = stage(on, ['work (w@x)'])
   expect(await run($, '')).toContain('● main  me@x · active')
@@ -922,7 +945,7 @@ test('on Linux the logins are files: ~/.claude/.credentials.json and ~/.claude/p
   }))
   on('process.run', (_$: any, e: any) => {
     argvs.push(e.argv.join(' '))
-    if (e.argv[0] === 'rm') delete files[e.argv[2]]
+    if (e.argv[0] === 'rm') for (const f of Object.keys(files)) if (f === e.argv[2] || f.startsWith(`${e.argv[2]}/`)) delete files[f]
     if (e.argv[0] === 'sh' && e.argv[2].includes('mv -f')) {
       if (isDiskFull) return { value: { exitCode: 1, stdout: '', stderr: 'No space left on device', isStdoutTruncated: false, isStderrTruncated: false } }
       files[e.argv[4]] = e.init.stdin // the file moved into place
@@ -930,13 +953,18 @@ test('on Linux the logins are files: ~/.claude/.credentials.json and ~/.claude/p
     return { value: { exitCode: 0, stdout: e.argv[0] === 'uname' ? 'Linux\n' : '', stderr: '', isStdoutTruncated: false, isStderrTruncated: false } }
   })
 
+  // What `claude auth login` writes, in the add's own folder.
+  const signIn = (tok: string, email: string) => {
+    files['/home/u/.claude/profile-add/.credentials.json'] = creds(tok)
+    files['/home/u/.claude/profile-add/.claude.json'] = JSON.stringify({ oauthAccount: { emailAddress: email } })
+  }
   await run($, 'add work')
   expect(argvs.some(a => a.includes('security'))).toBe(false)
-  files['/home/u/.claude/.credentials.json'] = creds('t-work') // what `claude auth login` writes
-  files['/home/u/.claude.json'] = JSON.stringify({ oauthAccount: { emailAddress: 'w@x' } })
+  signIn('t-work', 'w@x')
   await clock.advance(3000)
   expect(files['/home/u/.claude/profile-logins/work.json']).toContain('t-work')
-  expect(files['/home/u/.claude/.credentials.json']).toBe(creds('t-main')) // main put back
+  expect(files['/home/u/.claude/.credentials.json']).toBe(creds('t-main')) // the shared login never moved
+  expect(files['/home/u/.claude/profile-add/.credentials.json']).toBeUndefined() // the sign-in's copy cleared
   expect(argvs.some(a => a.includes('umask 077'))).toBe(true)
 
   expect(await run($, 'work')).toContain('✓ Switched to work (w@x)')
@@ -945,8 +973,7 @@ test('on Linux the logins are files: ~/.claude/.credentials.json and ~/.claude/p
   await run($, 'main')
   expect(await run($, 'add home')).toContain('✓ Sign-in for home opened')
   isDiskFull = true // the write goes to a file moved into place: no half-written login is left
-  files['/home/u/.claude/.credentials.json'] = creds('t-home')
-  files['/home/u/.claude.json'] = JSON.stringify({ oauthAccount: { emailAddress: 'h@x' } })
+  signIn('t-home', 'h@x')
   await clock.advance(3000)
   expect(files['/home/u/.claude/profile-logins/home.json']).toBeUndefined()
   isDiskFull = false
@@ -991,9 +1018,9 @@ function api(on: any, s: ReturnType<typeof stage>, before?: (turnId: string) => 
   return sent
 }
 
-test('a sign-in is saved only once it is whole: retried after a failed write, held till its credential lands, a refresh of the previous login kept, one account under two names refused', async ($, on) => {
+test('a sign-in is saved only once it is whole, in its own folder: retried after a failed write, held till both its parts land, one account under two names refused', async ($, on) => {
   const s = stage(on)
-  // The slot write fails once: tried again, and main put back.
+  // The slot write fails once: tried again.
   expect(await run($, 'add work')).toContain('✓ Sign-in for work opened')
   s.session.isKeychainBroken = true
   s.signIn('t-work', 'w@x')
@@ -1001,24 +1028,23 @@ test('a sign-in is saved only once it is whole: retried after a failed write, he
   s.session.isKeychainBroken = false
   await s.clock.advance(3000)
   expect(s.tokens().work).toBe('t-work')
-  expect(s.liveEmail()).toBe('me@x')
+  expect([s.liveToken(), s.liveEmail()]).toEqual(['t-main', 'me@x']) // the shared login never moved
 
-  // ~/.claude.json names the new account before its credential is written.
+  // The account lands before its credential, or the credential before its account: saved once both have.
   expect(await run($, 'add home')).toContain('✓ Sign-in for home opened')
-  s.files[CONFIG] = JSON.stringify({ ...JSON.parse(s.files[CONFIG]!), oauthAccount: { emailAddress: 'h@x' } })
+  s.files[ADD_CONFIG] = JSON.stringify({ oauthAccount: { emailAddress: 'h@x' } })
   await s.clock.advance(3000)
   expect(s.tokens().home).toBeUndefined()
-  s.keychain[LIVE] = creds('t-home')
+  s.keychain[`${ADD_KEY}|me`] = creds('t-home')
   await s.clock.advance(3000)
   expect(s.tokens().home).toBe('t-home')
-
-  // A window refreshes main while the browser sign-in takes minutes: the fresh copy is the one put back.
-  expect(await run($, 'add personal')).toContain('✓ Sign-in for personal opened')
-  s.keychain[LIVE] = creds('t-main-2')
+  expect(await run($, 'add fourth')).toContain('✓ Sign-in for fourth opened')
+  s.keychain[`${ADD_KEY}|me`] = creds('t-fourth')
   await s.clock.advance(6000)
-  s.signIn('t-personal', 'p@x')
+  expect(s.tokens().fourth).toBeUndefined()
+  s.files[ADD_CONFIG] = JSON.stringify({ oauthAccount: { emailAddress: 'f@x' } })
   await s.clock.advance(3000)
-  expect(s.liveToken()).toBe('t-main-2')
+  expect(s.tokens().fourth).toBe('t-fourth')
 
   // The browser reused home's claude.ai sign-in: not saved a second time.
   expect(await run($, 'add other')).toContain('✓ Sign-in for other opened')
@@ -1026,50 +1052,27 @@ test('a sign-in is saved only once it is whole: retried after a failed write, he
   await s.clock.advance(3000)
   expect(s.tokens().other).toBeUndefined()
   expect(s.toasts.at(-1)).toContain("That sign-in is home's account")
-  expect(s.liveEmail()).toBe('me@x')
+  expect(s.tokens().home).toBe('t-home')
 
-  // `claude auth login` writes the credential, then the account seconds later: nothing lands on main.
-  expect(await run($, 'add fourth')).toContain('✓ Sign-in for fourth opened')
-  s.keychain[LIVE] = creds('t-fourth')
-  await s.clock.advance(6000)
-  s.signIn('t-fourth', 'f@x')
-  await s.clock.advance(3000)
-  expect([s.tokens().main, s.tokens().fourth, s.liveToken()]).toEqual(['t-main-2', 't-fourth', 't-main-2'])
-
-  // The browser came back as the account you're on: the add ends once the sign-in has, keeping the new credential.
+  // The browser came back as the account you're on: refused once the sign-in has finished.
   s.session.loginPid = '777'
   expect(await run($, 'add fifth')).toContain('✓ Sign-in for fifth opened')
   s.signIn('t-main-3', 'me@x')
   await s.clock.advance(3000)
-  expect(s.tokens().fifth).toBeUndefined() // still running: could be a refresh
+  expect(s.toasts.at(-1)).not.toContain('fifth') // still running
   s.session.isLoginRunning = false
   await s.clock.advance(3000)
-  expect(s.toasts.at(-1)).toContain("That sign-in is main's account, the one you're on, so fifth wasn't saved")
-  expect(s.tokens().main).toBe('t-main-3')
+  expect(s.toasts.at(-1)).toContain("That sign-in is main's account, so fifth wasn't saved")
+  expect([s.tokens().fifth, s.tokens().main, s.liveToken()]).toEqual([undefined, 't-main', 't-main'])
   expect(await run($, 'add fifth')).toContain('✓ Sign-in for fifth opened') // no 10-minute wait
 })
 
-test("a login is never saved under another account's name: a failed config write rolls back, another window's half-done switch is caught, an unreadable account stops an add", async ($, on) => {
+test("a login is never saved under another account's name: a window still on 0.4 caught between its two writes", async ($, on) => {
   const s = stage(on)
   await added($, s, 'work', 't-work', 'w@x')
-
-  s.session.failWrite.add(CONFIG) // putting main back after the sign-in: its account doesn't land
-  expect(await run($, 'add home')).toContain('✓ Sign-in for home opened')
-  s.signIn('t-home', 'h@x')
-  await s.clock.advance(3000)
-  expect(s.liveToken()).toBe('t-home') // the Keychain went back: the next tick tries again
-  await s.clock.advance(3000)
-  expect([s.liveToken(), s.liveEmail(), s.tokens().main]).toEqual(['t-main', 'me@x', 't-main'])
-
-  s.keychain[LIVE] = creds('t-work') // a window still on 0.4 switching to work, between its two writes
-  expect(await run($, 'add personal')).toContain('✓ Sign-in for personal opened') // saves the live login as main's first
+  s.keychain[LIVE] = creds('t-work') // its /profile work: the login written, the account not yet
+  expect(await run($, 'add personal')).toContain('✓ Sign-in for personal opened') // saves the shared login as main's first
   expect(s.tokens().main).toBe('t-main') // not work's token
-  expect(await run($, 'remove personal')).toBe('✓ Removed personal')
-  s.keychain[LIVE] = creds('t-main')
-
-  s.session.unreadable.add(CONFIG) // over 4 MiB: nothing to save the live login by
-  expect(await run($, 'add personal')).toMatch(/^! Can't read your account/)
-  expect(s.argvs.filter(a => a.includes('claude auth login'))).toHaveLength(3)
 })
 
 test("data that can't be read doesn't break the plugin: a failed uname, a name printed as hex, a cut-off account, a Keychain listing that fails at startup", async ($, on) => {
@@ -1081,8 +1084,8 @@ test("data that can't be read doesn't break the plugin: a failed uname, a name p
 
   s.session.isHexForNonAscii = true
   expect(await run($, 'add work')).toContain('✓ Sign-in for work opened')
-  s.keychain[LIVE] = creds('t-work')
-  s.files[CONFIG] = JSON.stringify({ ...JSON.parse(s.files[CONFIG]!), oauthAccount: { emailAddress: 'w@x', displayName: 'Zoë' } })
+  s.keychain[`${ADD_KEY}|me`] = creds('t-work')
+  s.files[ADD_CONFIG] = JSON.stringify({ oauthAccount: { emailAddress: 'w@x', displayName: 'Zoë' } })
   await s.clock.advance(3000)
   expect(await run($, 'list')).toContain('○ work  w@x')
 
