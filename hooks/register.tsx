@@ -772,8 +772,26 @@ function serial<T>(f: () => Promise<T>): Promise<T> {
   return run
 }
 
+/**
+ * Why a switch failed. On a Team or Enterprise plan, or a machine with managed settings, Claude Code
+ * refuses a plugin outside the organization's a session's credential variables: said in plain words.
+ */
+const why = (err: Error) => (/not for plugins outside policy/.test(err.message)
+  ? 'On a Team or Enterprise plan, Claude Code lets only plugins its managed settings enable change the login a session sends · /login changes accounts; to switch with /profile, see "Team and Enterprise" in the README'
+  : err.message)
+
 const use = ($: EngineInterface, name: string) => serial(() => (name === API ? switchToApi($, false) : switchTo($, name)))
 const useApi = ($: EngineInterface, isAuto: boolean) => serial(() => switchToApi($, isAuto))
+
+// The account last picked with /profile, in any window: a new claude opens on it. Never API credit, billed per token.
+const PICKED = 'picked'
+
+/** A switch the person makes, which new windows follow; a failover's isn't one. */
+async function choose($: EngineInterface, name: string): Promise<string> {
+  const said = await use($, name)
+  if (said.startsWith('✓') && name !== API) await $.store.set(PICKED, name)
+  return said
+}
 
 async function switchTo($: EngineInterface, name: string): Promise<string> {
   if (await isDesktop($)) return DESKTOP
@@ -797,7 +815,7 @@ async function switchTo($: EngineInterface, name: string): Promise<string> {
   const email = login.oauthAccount?.emailAddress
   return [
     `✓ Switched to ${name}${email ? ` (${email})` : ''}`,
-    `Only this session moves, from your next message: other windows keep theirs, and a new one opens on ${cur}.`,
+    `Only this session moves, from your next message: other windows keep theirs, and new ones open on ${name}.`,
   ].join('\n')
 }
 
@@ -1084,12 +1102,13 @@ async function remove($: EngineInterface, name: string): Promise<string> {
   const add = await adding($)
   const isAdding = add?.name === name // whichever window started it
   if (!isAdding && !(await names($)).includes(name)) return '! Usage: /profile remove <name>'
-  if (!isAdding && (await current($)) === name) return `! ${name} is the shared login, the one new windows open on · /login as another account first`
+  if (!isAdding && (await current($)) === name) return `! ${name} is the shared login, the one windows not switched send · /login as another account first`
   if (!isAdding && (await active($)) === name) return `! ${name} is the account this session uses · /profile to another first`
   if (!(await deleteSlot($, name))) return `! Couldn't remove ${name}'s saved login · nothing changed`
   pending.delete(name)
   await keep($, name, null) // a new account added under the name starts without them
   await $.store.delete(`extra:${name}`)
+  if ((await $.store.get(PICKED)) === name) await $.store.delete(PICKED) // new windows open on the shared login again
   if (isAdding) { // its sign-in watch stops, and the browser sign-in with it
     if (add.pid && (await loginRunning($, add.pid))) await $.process.run(['kill', add.pid]).catch(() => undefined)
     await endAdd($)
@@ -1109,7 +1128,7 @@ async function pick($: EngineInterface): Promise<string | undefined> {
     return undefined // dismissed, or no one to ask (-p)
   }
   const i = labels.indexOf(answer)
-  if (i >= 0) return use($, others[i]!.name)
+  if (i >= 0) return choose($, others[i]!.name)
   if (answer === ADD) { // the same flows as /profile add <name> and /profile add api
     const kind = await $.ui.ask('Add which kind of account?', { header: 'Add', options: [ADD_SUB, ADD_API] }).catch(() => undefined)
     if (!kind) return undefined
@@ -1118,7 +1137,7 @@ async function pick($: EngineInterface): Promise<string | undefined> {
     return name ? add($, name.trim()) : undefined
   }
   const typed = answer.trim() // typed under Other: an account to switch to
-  return (await names($)).includes(typed) ? use($, typed) : `! No account ${typed} · /profile add ${NAME.test(typed) ? typed : '<name>'} to sign one in`
+  return (await names($)).includes(typed) ? choose($, typed) : `! No account ${typed} · /profile add ${NAME.test(typed) ? typed : '<name>'} to sign one in`
 }
 
 async function profile($: EngineInterface, args: string): Promise<string> {
@@ -1128,7 +1147,7 @@ async function profile($: EngineInterface, args: string): Promise<string> {
   if (verb === 'remove') return remove($, name)
   if (verb === 'list' || verb === 'status') return listText(await rows($))
   if (!verb) return (await pick($)) ?? listText(await rows($))
-  if ((await names($)).includes(verb)) return use($, verb)
+  if ((await names($)).includes(verb)) return choose($, verb)
   return `! No account ${verb} · /profile add ${NAME.test(verb) ? verb : '<name>'} to sign one in`
 }
 
@@ -1156,7 +1175,16 @@ export const register: Register = on => {
         await $.env.set('ANTHROPIC_AUTH_TOKEN', undefined)
         await leaveApi($)
       }
-    } else await $.env.set('CLAUDE_PROFILE_STARTED_ON', undefined)
+    } else {
+      await $.env.set('CLAUDE_PROFILE_STARTED_ON', undefined)
+      // A new process opens on the picked account, as a switch of its own; a reload stays where it is.
+      const picked = (await $.env.get('CLAUDE_PROFILE_OPENED')) ? undefined : await $.store.get(PICKED)
+      await $.env.set('CLAUDE_PROFILE_OPENED', '1')
+      if (typeof picked === 'string') {
+        const said = await use($, picked).catch((err: Error) => `! ${why(err)}`)
+        if (said.startsWith('!')) $.ui.toast(`New windows open on ${picked}, but this one couldn't: ${said.slice(2)}`, { timeoutMs: 8000 })
+      }
+    }
     const h = await home($)
     await $.fs.write(`${h}/.claude/profile-statusline.sh`, STATUSLINE).catch(() => undefined)
     await claimStatusLine($).catch(() => undefined)
@@ -1229,7 +1257,7 @@ export const register: Register = on => {
       await syncToken($).catch(() => undefined) // another window refreshed it, revoking this copy: go again on the fresh one
       if (held !== (await credential($))) continue
       const switched = failing ? await awaitSwitch($, failing, next.signal)
-        : await (failing = failover($).catch((err: Error) => ($.ui.toast(`Couldn't switch accounts: ${err.message}`, { timeoutMs: 8000 }), false)).finally(() => (failing = undefined)))
+        : await (failing = failover($).catch((err: Error) => ($.ui.toast(`Couldn't switch accounts: ${why(err)}`, { timeoutMs: 8000 }), false)).finally(() => (failing = undefined)))
       if (!switched || next.signal.aborted) return r
     }
   })
@@ -1297,7 +1325,7 @@ export const register: Register = on => {
     return { text: await usagePanel($, name) }
   })
 
-  on('command.run', { command: 'profile' }, async ($, e) => ({ text: await profile($, e.args).catch((err: Error) => `! ${err.message}`) }))
+  on('command.run', { command: 'profile' }, async ($, e) => ({ text: await profile($, e.args).catch((err: Error) => `! ${why(err)}`) }))
 
   on('prompt.submit', async ($, e, next) => {
     declined = undefined

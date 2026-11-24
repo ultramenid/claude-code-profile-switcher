@@ -1,6 +1,6 @@
 # claude-code-profile-switcher
 
-Switch Claude Code between accounts with `/profile`. A switch moves only the session you run it in: other open windows keep their account, so switching in one never logs another out. The plugin also shows which account you're on and how much of its plan you've used, and when an account runs out it moves the session to the next one, then to your Console API credit once every account is out, so the work carries on.
+Switch Claude Code between accounts with `/profile`. A switch moves only the session you run it in, and the windows you open after it: other open windows keep their account, so switching in one never logs another out. The plugin also shows which account you're on and how much of its plan you've used, and when an account runs out it moves the session to the next one, then to your Console API credit once every account is out, so the work carries on.
 
 ## Install
 
@@ -20,7 +20,7 @@ Works in the terminal. In the Code tab of the Claude desktop app, the account ro
 | `/profile` | Picker: switch to another signed-in account, or add one (a subscription account, as `/profile add <name>`, or API credit, as `/profile add api`) |
 | `/profile list` | All accounts with email and last plan usage (`5h 23% 7d 40%`), and `api` with its key's last four characters; `●` marks the one this session uses |
 | `/profile add <name>` | Opens a browser login for another account; a notice says when it's saved. No window's login moves meanwhile |
-| `/profile <name>` | Moves this session to that account from your next message. Other windows, and new ones, stay where they are |
+| `/profile <name>` | Moves this session to that account from your next message, and new windows open on it. Other open windows stay where they are |
 | `/profile remove <name>` | Forgets a saved account (not the live one, or the one this session uses), with its usage readings |
 | `/profile add api` | Sets up API credit: opens a box above the prompt; paste your Console API key (console.anthropic.com → API keys) and press Enter. The key goes to the plugin alone, never the prompt or its history |
 | `/profile api` | Bills this session to that key now; `/profile <name>` goes back |
@@ -98,10 +98,41 @@ The Console key is kept the same way, as the account `api`. Switching to it touc
 
 The status line is a small script, `~/.claude/profile-statusline.sh`, that prints a file the plugin keeps current for each session.
 
+## Team and Enterprise
+
+On a Team or Enterprise plan, or a machine with managed settings, Claude Code (2.1.330 and later) lets only the plugins its managed settings enable change the login a session sends. Installed the usual way, the plugin is refused there: `/profile <name>`, `/profile api` and switching when an account runs out say so and change nothing. The account row, `/profile list`, `add` and `remove` still work, and `/login` changes accounts.
+
+To switch with `/profile` there, an administrator enables the plugin in managed settings, read in place from a folder on the machine (a copy in the plugin cache doesn't count). On macOS:
+
+```sh
+sudo mkdir -p "/Library/Application Support/ClaudeCode/marketplaces"
+sudo git clone https://github.com/ultramenid/claude-code-profile-switcher "/Library/Application Support/ClaudeCode/marketplaces/claude-code-profile-switcher"
+```
+
+Then, in `/Library/Application Support/ClaudeCode/managed-settings.json` (owned by root):
+
+```json
+{
+  "extraKnownMarketplaces": {
+    "claude-code-profile-switcher": {
+      "source": { "source": "directory", "path": "/Library/Application Support/ClaudeCode/marketplaces/claude-code-profile-switcher" }
+    }
+  },
+  "enabledPlugins": { "profile@claude-code-profile-switcher": true },
+  "appendPlugins": ["profile@claude-code-profile-switcher"]
+}
+```
+
+Restart Claude Code. To check, start `claude --debug` and look in the debug log for `hooks module profile@claude-code-profile-switcher loaded` with `tier append`; with `tier user`, a line starting `profile@claude-code-profile-switcher is enabled by managed settings, but` says what's missing. To update the plugin: `sudo git -C "/Library/Application Support/ClaudeCode/marketplaces/claude-code-profile-switcher" pull`.
+
+If your organization also sends managed settings from the claude.ai admin console, Claude Code ignores the plugin keys in this file unless those settings set `managedSourcesBehavior` to `"merge"`.
+
+Managed settings on a machine apply to every login on it, a personal plan's too: Claude Code then keeps the other plugins you install out of your settings' hooks and prompt content, as it does on a Team plan.
+
 ## Limitations
 
 - **A switched session:** requests use the switched account, while Claude Code's own `/status`, email and claude.ai connectors stay the shared login's. Plan usage still works: the plugin reads the account's 5-hour and 7-day usage from the plan's usage figures as it switches and once a minute after, idle or not, and `/usage`, `/profile list`, the status line and the row above the prompt show it.
-- **New windows open on the shared login:** Claude Code's own login, the one you last signed in with (`/login`), not the account you last switched to. A `/login` changes it for every window that isn't switched, and their rows follow.
+- **New windows open on the account you last picked** with `/profile <name>` in any window, switched to it as that window's own session (so the line above applies). A failover's switch or `/profile api` isn't a pick, and before your first pick, or once the picked account is removed, new windows open on the shared login: Claude Code's own login, the one you last signed in with (`/login`). A `/login` changes that one for every window that isn't switched, and their rows follow. A window already open stays where it is, through a plugin reload too.
 - **Remote Control** runs under the shared login, so a switch or an add leaves it connected. Claude Code disconnects it when the shared login changes (a `/login`) and shows a notice. The plugin then runs `/remote-control` to reconnect it, in every open window (each checks every 5 seconds) that had Remote Control: you ran `/remote-control` there, the Claude mobile app is attached, or, in the terminal, `remoteControlAtStartup` is on. The desktop app's and VS Code's own auto-connect toggles can't be read by a plugin, so run `/remote-control` there yourself once.
 - **The desktop app:** each of its sessions uses the app's own account, whatever the plugin sets, so `/profile <name>`, `/profile api` and switching when an account runs out work only in `claude` in a terminal. A desktop session shows the app's account in its row. A tested limit of Claude Code there, not something a plugin can change.
 - **Windows is untested:** macOS is tested in daily use and Linux by the test suite; Windows follows the same file layout as Linux but hasn't been run yet, and the status line isn't set up there automatically. Reports welcome.

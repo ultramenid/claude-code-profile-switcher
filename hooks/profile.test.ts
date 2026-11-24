@@ -40,7 +40,10 @@ function stage(on: any, answers: string[] = []) {
   const context: { tokens?: number; window: number; percent?: number } = { tokens: 216_300, window: 1_000_000, percent: 22 }
   on('session.usage', () => ({ value: { startedAt: 0, context, rateLimits } }))
   on('env.get', (_$: any, e: any) => ({ value: env[e.name] }))
-  on('env.set', (_$: any, e: any) => ((env[e.name] = e.value), { value: undefined }))
+  // On a Team plan, Claude Code's security default refuses a plugin the credential variables.
+  on('env.set', (_$: any, e: any) => (session.isTeamPlan && /^ANTHROPIC_/.test(e.name)
+    ? { deny: `env (managed): ${e.name} is not for plugins outside policy to change` }
+    : ((env[e.name] = e.value), { value: undefined })))
   const store: Record<string, unknown> = {}
   on('store.get', (_$: any, e: any) => ({ value: e.key in store ? structuredClone(store[e.key]) : undefined }))
   on('store.set', (_$: any, e: any) => ((store[e.key] = structuredClone(e.value)), { value: undefined }))
@@ -64,6 +67,7 @@ function stage(on: any, answers: string[] = []) {
     holds: {} as Record<string, { reached: () => void; shut: Promise<void> }>, // usage reads held till opened
     renewals: {} as Record<string, string>, // the token endpoint: a refresh token it takes once, and the access token it hands back
     isLockHeld: false, // another process holds Claude Code's refresh lock
+    isTeamPlan: false, // the login is a Team or Enterprise seat
     loginDir: undefined as string | undefined, // the CLAUDE_CONFIG_DIR a running `claude auth login` writes to
     transcript: [] as string[], // this session's transcript lines
   }
@@ -202,7 +206,7 @@ test('add captures a full login and puts the current one back; switching moves t
     'Accounts\n● main  me@x · active\n○ work  w@x\n\n/profile <name> switch · /profile add <name> · /profile remove <name>',
   )
 
-  expect(await run($, 'work')).toBe('✓ Switched to work (w@x)\nOnly this session moves, from your next message: other windows keep theirs, and a new one opens on main.')
+  expect(await run($, 'work')).toBe('✓ Switched to work (w@x)\nOnly this session moves, from your next message: other windows keep theirs, and new ones open on work.')
   expect(keychain['Claude Code-credentials|me']).toBe(creds('t-main')) // the shared login stays main's
   expect(liveEmail()).toBe('me@x')
   expect(env.ANTHROPIC_AUTH_TOKEN).toBe('t-work')
@@ -1311,6 +1315,30 @@ test('a key a tool started with stays blanked when the session leaves API credit
   expect(JSON.stringify(await printed)).not.toContain(CONSOLE_KEY)
 })
 
+test('a new claude opens on the account last picked with /profile; a reload stays put, and a removed pick opens on the shared login', async ($, on) => {
+  const s = stage(on)
+  const newProcess = () => ['ANTHROPIC_AUTH_TOKEN', 'CLAUDE_PROFILE_USING', 'CLAUDE_PROFILE_OPENED'].forEach(k => delete s.env[k])
+  await start($)
+  await added($, s, 'work', 't-work', 'w@x')
+  await run($, 'work')
+  newProcess()
+  await start($)
+  expect(s.env.ANTHROPIC_AUTH_TOKEN).toBe('t-work')
+  expect(s.liveToken()).toBe('t-main') // the shared login stays main's
+  expect(await run($, 'list')).toContain('● work  w@x · active')
+
+  expect(await run($, 'main')).toContain('✓ Switched to main')
+  s.store.picked = 'work' // another window picked work since
+  await start($) // a reload: this window stays where it was put
+  expect(s.env.ANTHROPIC_AUTH_TOKEN).toBeUndefined()
+
+  expect(await run($, 'remove work')).toBe('✓ Removed work')
+  newProcess()
+  await start($)
+  expect(s.env.ANTHROPIC_AUTH_TOKEN).toBeUndefined()
+  expect(s.toasts.filter(t => t.startsWith('New windows'))).toEqual([])
+})
+
 test('a token sync in flight never puts back a token a switch just dropped; a moment of unreadable ~/.claude.json is no login change', async ($, on) => {
   const s = stage(on)
   s.files['/home/u/.claude/settings.json'] = '{"remoteControlAtStartup":true}'
@@ -1382,4 +1410,16 @@ test('/login here moves the row with the shared login: a Keychain read that fail
   expect(s.files['/home/u/.claude/profile-status.txt']).toContain('work')
   expect(await run($, 'main')).toContain('✓ Switched to main') // not "Already on main"
   expect(s.env.ANTHROPIC_AUTH_TOKEN).toBe('t-main')
+})
+
+test('a Team plan refusing the switch is said in plain words, and nothing moves', async ($, on) => {
+  const s = stage(on)
+  await start($)
+  await added($, s, 'work', 't-work', 'w@x')
+  s.session.isTeamPlan = true
+  const said = await run($, 'work')
+  expect(said).toContain('! On a Team or Enterprise plan')
+  expect(said).not.toContain('$.env.set')
+  expect(s.env.ANTHROPIC_AUTH_TOKEN).toBeUndefined()
+  expect(await run($, 'list')).toContain('● main  me@x · active')
 })
